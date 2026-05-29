@@ -15,6 +15,8 @@ pub enum TimeSourceError {
     Protocol(String),
     #[error("parse error: {0}")]
     Parse(String),
+    #[error("config error: {0}")]
+    Config(String),
 }
 
 pub trait TimeSource {
@@ -49,10 +51,12 @@ impl Orchestrator {
                     return Ok((offset, src.name()));
                 }
                 Err(e) => {
-                    if self.verbose || matches!(e, TimeSourceError::Protocol(_) | TimeSourceError::Parse(_)) {
-                        eprintln!("[{}] failed: {}", src.name(), e);
+                    if !matches!(e, TimeSourceError::Config(_)) {
+                        if self.verbose || matches!(e, TimeSourceError::Protocol(_) | TimeSourceError::Parse(_)) {
+                            eprintln!("[{}] failed: {}", src.name(), e);
+                        }
+                        last_err = Some(format!("{}: {}", src.name(), e));
                     }
-                    last_err = Some(format!("{}: {}", src.name(), e));
                 }
             }
         }

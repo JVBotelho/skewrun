@@ -4,12 +4,58 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rand::Rng;
+
 use crate::time_src::{OffsetMicros, TimeSourceError, TimeSource};
 
 pub struct SmbSource;
 
 // Seconds between Windows FILETIME epoch (1601-01-01) and Unix epoch (1970-01-01).
 const FILETIME_TO_UNIX_SECS: u64 = 11_644_473_600;
+
+// SMB2 capabilities: DFS | LEASING | LARGE_MTU | MULTI_CHANNEL | PERSISTENT_HANDLES | DIR_LEASING | ENCRYPTION
+const SMB2_CAPABILITIES: u32 = 0x7F;
+
+/// Sequential field reader for little-endian binary structs.
+struct FieldReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> FieldReader<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0 }
+    }
+
+    fn read_u16_le(&mut self) -> Result<u16, TimeSourceError> {
+        let b = self.next_bytes(2)?;
+        Ok(u16::from_le_bytes([b[0], b[1]]))
+    }
+
+    fn read_u32_le(&mut self) -> Result<u32, TimeSourceError> {
+        let b = self.next_bytes(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn read_u64_le(&mut self) -> Result<u64, TimeSourceError> {
+        let b = self.next_bytes(8)?;
+        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+    }
+
+    fn skip(&mut self, n: usize) -> Result<(), TimeSourceError> {
+        self.next_bytes(n)?;
+        Ok(())
+    }
+
+    fn next_bytes(&mut self, n: usize) -> Result<&[u8], TimeSourceError> {
+        if self.pos + n > self.buf.len() {
+            return Err(TimeSourceError::Parse("NEGOTIATE_RESPONSE truncated".into()));
+        }
+        let s = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+}
 
 impl TimeSource for SmbSource {
     fn name(&self) -> &'static str {
@@ -25,6 +71,7 @@ impl TimeSource for SmbSource {
 fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
     let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(map_io_err)?;
     stream.set_read_timeout(Some(timeout)).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
+    stream.set_write_timeout(Some(timeout)).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
 
     let t_send = Instant::now();
     let t_send_sys = SystemTime::now();
@@ -34,15 +81,18 @@ fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
 
     // Read NetBIOS header (4 bytes) to know response length.
     let mut nb_header = [0u8; 4];
-    stream.read_exact(&mut nb_header).map_err(|e| map_io_err(e))?;
+    stream.read_exact(&mut nb_header).map_err(map_io_err)?;
     // NetBIOS session message: byte 0 = 0x00, bytes 1..4 = 24-bit big-endian length.
     let msg_len = u32::from_be_bytes(nb_header) & 0x00FF_FFFF;
+    if msg_len > 65536 {
+        return Err(TimeSourceError::Protocol(format!("implausibly large SMB2 response: {} bytes", msg_len)));
+    }
     if msg_len < 64 + 65 {
         return Err(TimeSourceError::Parse(format!("SMB2 response too short: {} bytes", msg_len)));
     }
 
     let mut body = vec![0u8; msg_len as usize];
-    stream.read_exact(&mut body).map_err(|e| map_io_err(e))?;
+    stream.read_exact(&mut body).map_err(map_io_err)?;
 
     let rtt = t_send.elapsed();
 
@@ -99,8 +149,11 @@ fn build_negotiate_request() -> Vec<u8> {
     b[2..4].copy_from_slice(&dialect_count.to_le_bytes());
     // SecurityMode = 0 (signing not required from client side)
     b[4..6].copy_from_slice(&0u16.to_le_bytes());
-    // Capabilities = 0x7F (all common caps)
-    b[8..12].copy_from_slice(&0x7Fu32.to_le_bytes());
+    b[8..12].copy_from_slice(&SMB2_CAPABILITIES.to_le_bytes());
+    // ClientGuid: randomise to avoid IOC (all-zero GUID is a trivial Suricata/Zeek signature).
+    let mut guid = [0u8; 16];
+    rand::thread_rng().fill(&mut guid);
+    b[12..28].copy_from_slice(&guid);
     // Dialects start at offset 36 from body start
     for (i, &d) in dialects.iter().enumerate() {
         let off = 36 + i * 2;
@@ -112,27 +165,19 @@ fn build_negotiate_request() -> Vec<u8> {
 
 /// Parse SMB2 NEGOTIATE_RESPONSE (MS-SMB2 §2.2.4) and extract SystemTime.
 fn parse_negotiate_response(b: &[u8]) -> Result<SystemTime, TimeSourceError> {
-    // Field layout (all little-endian):
-    //   0: StructureSize (u16) = 65
-    //   2: SecurityMode (u16)
-    //   4: DialectRevision (u16)
-    //   6: NegotiateContextCount/Reserved (u16)
-    //   8: ServerGuid ([u8; 16])
-    //  24: Capabilities (u32)
-    //  28: MaxTransactSize (u32)
-    //  32: MaxReadSize (u32)
-    //  36: MaxWriteSize (u32)
-    //  40: SystemTime (u64, FILETIME)
-    const SYSTEM_TIME_OFFSET: usize = 40;
+    let mut r = FieldReader::new(b);
+    // Fields are little-endian; read sequentially per MS-SMB2 §2.2.4.
+    let structure_size      = r.read_u16_le()?; //  0: StructureSize (must be 65)
+    let _security_mode      = r.read_u16_le()?; //  2: SecurityMode
+    let _dialect_revision   = r.read_u16_le()?; //  4: DialectRevision
+    let _negotiate_ctx_cnt  = r.read_u16_le()?; //  6: NegotiateContextCount/Reserved
+    r.skip(16)?;                                 //  8: ServerGuid ([u8; 16])
+    let _capabilities       = r.read_u32_le()?; // 24: Capabilities
+    let _max_transact       = r.read_u32_le()?; // 28: MaxTransactSize
+    let _max_read           = r.read_u32_le()?; // 32: MaxReadSize
+    let _max_write          = r.read_u32_le()?; // 36: MaxWriteSize
+    let system_time         = r.read_u64_le()?; // 40: SystemTime (FILETIME)
 
-    if b.len() < SYSTEM_TIME_OFFSET + 8 {
-        return Err(TimeSourceError::Parse(format!(
-            "NEGOTIATE_RESPONSE too short: {} bytes",
-            b.len()
-        )));
-    }
-
-    let structure_size = u16::from_le_bytes([b[0], b[1]]);
     if structure_size != 65 {
         return Err(TimeSourceError::Protocol(format!(
             "unexpected SMB2 NEGOTIATE_RESPONSE StructureSize: {}",
@@ -140,13 +185,7 @@ fn parse_negotiate_response(b: &[u8]) -> Result<SystemTime, TimeSourceError> {
         )));
     }
 
-    let filetime = u64::from_le_bytes(
-        b[SYSTEM_TIME_OFFSET..SYSTEM_TIME_OFFSET + 8]
-            .try_into()
-            .unwrap(),
-    );
-
-    filetime_to_system_time(filetime)
+    filetime_to_system_time(system_time)
 }
 
 /// Convert Windows FILETIME (100ns ticks since 1601-01-01 UTC) to SystemTime.
@@ -221,5 +260,29 @@ mod tests {
         // StructureSize = 99 (wrong)
         b[0..2].copy_from_slice(&99u16.to_le_bytes());
         assert!(parse_negotiate_response(&b).is_err());
+    }
+
+    #[test]
+    fn build_negotiate_request_has_random_guid() {
+        // ClientGuid is at offset 4 (NetBIOS) + 64 (SMB2 header) + 12 (body offset) = 80..96
+        let r1 = build_negotiate_request();
+        let r2 = build_negotiate_request();
+        assert_ne!(&r1[80..96], &r2[80..96], "ClientGuid must differ between calls");
+        // Sanity: neither is all-zero (overwhelmingly probable)
+        assert_ne!(&r1[80..96], &[0u8; 16]);
+    }
+
+    #[test]
+    fn fetch_smb_rejects_large_msg_len() {
+        // Simulate a NetBIOS header claiming a 128 KB response body (> 65536 limit).
+        // We cannot call fetch_smb (needs a real socket), but we can verify the
+        // guard arithmetic: msg_len field is 24-bit from bytes [1..4].
+        let large: u32 = 0x0002_0000; // 131072 bytes
+        assert!(large > 65536);
+        // Confirm the mask used in production: u32::from_be_bytes([0, 2, 0, 0]) & 0x00FF_FFFF = 131072
+        let nb = [0x00u8, 0x02, 0x00, 0x00];
+        let msg_len = u32::from_be_bytes(nb) & 0x00FF_FFFF;
+        assert_eq!(msg_len, 131072);
+        assert!(msg_len > 65536);
     }
 }

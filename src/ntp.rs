@@ -37,15 +37,13 @@ fn fetch_ntp(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
     req[40..44].copy_from_slice(&t1_ntp.0.to_be_bytes());
     req[44..48].copy_from_slice(&t1_ntp.1.to_be_bytes());
 
+    socket.connect(addr).map_err(|e| map_io_err(e, "connect"))?;
+
     let t_send = Instant::now();
-    socket
-        .send_to(&req, addr)
-        .map_err(|e| map_io_err(e, "send"))?;
+    socket.send(&req).map_err(|e| map_io_err(e, "send"))?;
 
     let mut buf = [0u8; 48];
-    let (n, _) = socket
-        .recv_from(&mut buf)
-        .map_err(|e| map_io_err(e, "recv"))?;
+    let n = socket.recv(&mut buf).map_err(|e| map_io_err(e, "recv"))?;
     let rtt = t_send.elapsed();
 
     if n < 48 {
@@ -73,6 +71,9 @@ fn fetch_ntp(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
 }
 
 /// Parse 8-byte NTP timestamp (u32 seconds + u32 fraction) into Unix microseconds.
+///
+/// Assumes NTP Era 0 (epoch 1900-01-01). Era 0 wraps on 2036-02-07; Era 1 detection
+/// is not implemented (out of scope for a pentest tool — see Known Limitations).
 fn parse_ntp_timestamp(b: &[u8]) -> Result<i64, TimeSourceError> {
     if b.len() < 8 {
         return Err(TimeSourceError::Parse("NTP timestamp too short".into()));
@@ -80,13 +81,14 @@ fn parse_ntp_timestamp(b: &[u8]) -> Result<i64, TimeSourceError> {
     let secs = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as u64;
     let frac = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
 
-    if secs < NTP_TO_UNIX as u32 as u64 {
+    if secs < NTP_TO_UNIX {
         return Err(TimeSourceError::Parse(format!("NTP seconds {} predates Unix epoch", secs)));
     }
     let unix_secs = secs - NTP_TO_UNIX;
     // Integer-only: frac * 1_000_000 / 2^32 microseconds
     let frac_us = (frac as u64 * 1_000_000) >> 32;
-    Ok((unix_secs * 1_000_000 + frac_us) as i64)
+    i64::try_from(unix_secs * 1_000_000 + frac_us)
+        .map_err(|_| TimeSourceError::Parse("NTP timestamp overflows i64 (post-2262)".into()))
 }
 
 /// Convert SystemTime to (NTP seconds, NTP fraction).

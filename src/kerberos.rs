@@ -15,8 +15,17 @@ use rand::Rng;
 
 use crate::time_src::{OffsetMicros, TimeSourceError, TimeSource};
 
+// DER/ASN.1 tag constants used in KRB-ERROR parsing.
+const KRB_ERROR_TAG: u8 = 0x7E; // APPLICATION 30
+const SEQUENCE_TAG: u8 = 0x30;
+const STIME_TAG: u8 = 0xA4;     // context [4]
+const SUSEC_TAG: u8 = 0xA5;     // context [5]
+const GENERALIZED_TIME_TAG: u8 = 0x18;
+const INTEGER_TAG: u8 = 0x02;
+
 pub struct KerberosSource {
-    pub realm: String,
+    pub realm: Option<String>,
+    pub stealth_user: String,
 }
 
 impl TimeSource for KerberosSource {
@@ -25,19 +34,22 @@ impl TimeSource for KerberosSource {
     }
 
     fn fetch(&self, target: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
+        let realm = self.realm.as_deref()
+            .ok_or_else(|| TimeSourceError::Config("no realm configured".into()))?;
         let krb_addr: SocketAddr = (target.ip(), 88).into();
-        fetch_kerberos(krb_addr, &self.realm, timeout)
+        fetch_kerberos(krb_addr, realm, &self.stealth_user, timeout)
     }
 }
 
-fn fetch_kerberos(addr: SocketAddr, realm: &str, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
+fn fetch_kerberos(addr: SocketAddr, realm: &str, stealth_user: &str, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
     let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(map_io_err)?;
     stream.set_read_timeout(Some(timeout)).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
+    stream.set_write_timeout(Some(timeout)).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
 
     let t_send_sys = SystemTime::now();
     let t_send = Instant::now();
 
-    let req = build_as_req(realm);
+    let req = build_as_req(realm, stealth_user);
     // RFC 4120 §7.2.2: TCP Kerberos messages are prefixed by 4-byte big-endian length.
     let len = (req.len() as u32).to_be_bytes();
     stream.write_all(&len).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
@@ -45,14 +57,14 @@ fn fetch_kerberos(addr: SocketAddr, realm: &str, timeout: Duration) -> Result<Of
 
     // Read response length prefix.
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(|e| map_io_err(e))?;
+    stream.read_exact(&mut len_buf).map_err(map_io_err)?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
 
     if resp_len > 65536 {
         return Err(TimeSourceError::Protocol(format!("implausibly large KRB response: {} bytes", resp_len)));
     }
     let mut resp = vec![0u8; resp_len];
-    stream.read_exact(&mut resp).map_err(|e| map_io_err(e))?;
+    stream.read_exact(&mut resp).map_err(map_io_err)?;
 
     let rtt = t_send.elapsed();
 
@@ -68,9 +80,9 @@ pub fn parse_krb_error(data: &[u8]) -> Result<i64, TimeSourceError> {
     // DER structure: 0x7E <len> <SEQUENCE contents>
     let mut pos = 0;
     let tag = next_byte(data, &mut pos, "KRB-ERROR tag")?;
-    if tag != 0x7E {
+    if tag != KRB_ERROR_TAG {
         return Err(TimeSourceError::Protocol(format!(
-            "expected KRB-ERROR tag 0x7E, got 0x{:02X}", tag
+            "expected KRB-ERROR tag 0x{:02X}, got 0x{:02X}", KRB_ERROR_TAG, tag
         )));
     }
 
@@ -79,19 +91,23 @@ pub fn parse_krb_error(data: &[u8]) -> Result<i64, TimeSourceError> {
 
     // The KRB-ERROR SEQUENCE wraps the fields. Outer SEQUENCE tag.
     let seq_tag = next_byte(data, &mut pos, "KRB-ERROR SEQUENCE tag")?;
-    if seq_tag != 0x30 {
+    if seq_tag != SEQUENCE_TAG {
         return Err(TimeSourceError::Parse(format!(
-            "expected SEQUENCE tag 0x30, got 0x{:02X}", seq_tag
+            "expected SEQUENCE tag 0x{:02X}, got 0x{:02X}", SEQUENCE_TAG, seq_tag
         )));
     }
-    skip_der_length(data, &mut pos)?;
+    let seq_len = read_der_length(data, &mut pos)?;
+    let seq_end = pos + seq_len;
+    if seq_end > data.len() {
+        return Err(TimeSourceError::Parse("KRB-ERROR SEQUENCE overruns buffer".into()));
+    }
 
     // Scan context-tagged fields until we find [4] (stime) and [5] (susec).
+    // Bound by seq_end to prevent tag-injection from bytes appended after the SEQUENCE.
     let mut stime_us: Option<i64> = None;
     let mut susec: Option<u32> = None;
 
-    while pos < data.len() && (stime_us.is_none() || susec.is_none()) {
-        if pos >= data.len() { break; }
+    while pos < seq_end && (stime_us.is_none() || susec.is_none()) {
         let field_tag = next_byte(data, &mut pos, "field tag")?;
         let field_len = read_der_length(data, &mut pos)?;
 
@@ -103,12 +119,10 @@ pub fn parse_krb_error(data: &[u8]) -> Result<i64, TimeSourceError> {
         pos += field_len;
 
         match field_tag {
-            0xA4 => {
-                // [4] stime: KerberosTime (GeneralizedTime, tag 0x18)
+            STIME_TAG => {
                 stime_us = Some(parse_context_generalizedtime(field_data)?);
             }
-            0xA5 => {
-                // [5] susec: Microseconds (INTEGER, tag 0x02)
+            SUSEC_TAG => {
                 susec = Some(parse_context_integer_u32(field_data)?);
             }
             _ => { /* skip other fields */ }
@@ -118,8 +132,7 @@ pub fn parse_krb_error(data: &[u8]) -> Result<i64, TimeSourceError> {
     let stime = stime_us.ok_or_else(|| TimeSourceError::Parse("KRB-ERROR missing stime [4]".into()))?;
     let sus = susec.unwrap_or(0);
 
-    // Combine: stime is in seconds, susec in microseconds within that second.
-    // stime from KerberosTime already rounded to seconds.
+    // stime_us is Unix microseconds; susec is 0..999_999 additional offset within the second.
     Ok(stime + sus as i64)
 }
 
@@ -127,8 +140,8 @@ pub fn parse_krb_error(data: &[u8]) -> Result<i64, TimeSourceError> {
 fn parse_context_generalizedtime(b: &[u8]) -> Result<i64, TimeSourceError> {
     let mut pos = 0;
     let tag = next_byte(b, &mut pos, "GeneralizedTime tag")?;
-    if tag != 0x18 {
-        return Err(TimeSourceError::Parse(format!("expected GeneralizedTime 0x18, got 0x{:02X}", tag)));
+    if tag != GENERALIZED_TIME_TAG {
+        return Err(TimeSourceError::Parse(format!("expected GeneralizedTime 0x{:02X}, got 0x{:02X}", GENERALIZED_TIME_TAG, tag)));
     }
     let len = read_der_length(b, &mut pos)?;
     if pos + len > b.len() {
@@ -143,8 +156,8 @@ fn parse_context_generalizedtime(b: &[u8]) -> Result<i64, TimeSourceError> {
 fn parse_context_integer_u32(b: &[u8]) -> Result<u32, TimeSourceError> {
     let mut pos = 0;
     let tag = next_byte(b, &mut pos, "INTEGER tag")?;
-    if tag != 0x02 {
-        return Err(TimeSourceError::Parse(format!("expected INTEGER 0x02, got 0x{:02X}", tag)));
+    if tag != INTEGER_TAG {
+        return Err(TimeSourceError::Parse(format!("expected INTEGER 0x{:02X}, got 0x{:02X}", INTEGER_TAG, tag)));
     }
     let len = read_der_length(b, &mut pos)?;
     if pos + len > b.len() || len > 4 {
@@ -195,11 +208,15 @@ fn civil_to_days(y: i64, m: i64, d: i64) -> Result<i64, TimeSourceError> {
     Ok(era * 146097 + doe - 719468)
 }
 
-/// Build a minimal AS-REQ DER for a nonexistent principal in the given realm.
-pub fn build_as_req(realm: &str) -> Vec<u8> {
+/// Build a minimal AS-REQ DER for the given `cname` principal in `realm`.
+///
+/// `cname` should blend in with the environment (e.g. a plausible admin typo like
+/// "admnistrator"). Using a recognizable prefix like "nonexistent" is a trivial SIEM
+/// fingerprint (`^nonexistent\d+$`). A typo of a known-but-wrong principal generates
+/// Event 4768 with FailureCode 0x6 (unknown principal), which is universal AD noise.
+pub fn build_as_req(realm: &str, cname: &str) -> Vec<u8> {
     let nonce: u32 = rand::thread_rng().gen();
     let till = kerberos_time_far_future();
-    let cname = format!("nonexistent{}", rand::thread_rng().gen::<u16>());
 
     // Encode sub-structures.
     let pvno = der_integer(5);
@@ -406,7 +423,7 @@ mod tests {
 
     #[test]
     fn build_as_req_parseable() {
-        let req = build_as_req("CORP.LOCAL");
+        let req = build_as_req("CORP.LOCAL", "admnistrator");
         // Should start with APPLICATION 10 tag (0x6A)
         assert_eq!(req[0], 0x6A);
         // Total length should be reasonable (> 50 bytes)
@@ -431,5 +448,24 @@ mod tests {
         // 2024-01-15 10:30:00 UTC = Unix 1705314600
         let us = parse_generalized_time("20240115103000Z").unwrap();
         assert_eq!(us, 1_705_314_600 * 1_000_000);
+    }
+
+    #[test]
+    fn parse_krb_error_rejects_post_sequence_injection() {
+        // Build a valid KRB-ERROR, then append forged [4]/[5] tags after the SEQUENCE.
+        // The parser must NOT read those appended bytes; seq_end bound must hold.
+        let valid = sample_krb_error();
+
+        // Forge a [4] tag with a different stime (year 2099-01-01 00:00:00Z = 4070908800)
+        let forged_stime = der_context(4, &der_generalizedtime("20990101000000Z"));
+        let forged_susec = der_context(5, &der_integer(999_999u64));
+        let mut injected = valid.clone();
+        injected.extend_from_slice(&forged_stime);
+        injected.extend_from_slice(&forged_susec);
+
+        // Parser must return the original stime, not the forged one.
+        let us = parse_krb_error(&injected).unwrap();
+        let expected = 1_705_314_600i64 * 1_000_000 + 123_456;
+        assert_eq!(us, expected, "post-sequence tag injection must be ignored");
     }
 }

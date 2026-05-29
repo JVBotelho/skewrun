@@ -79,12 +79,14 @@ ARGS:
 OPTIONS:
   -r, --realm <R>    Kerberos realm (e.g. CORP.LOCAL)
                      Falls back to $KRB5_CONFIG / /etc/krb5.conf if absent
-  -m, --method <M>   Comma-separated source order. Default: kerberos,ntp,smb
-      --timeout <S>  Per-method timeout in seconds. Default: 3
-  -v, --verbose      Show handshake details on stderr
-  -n, --dry-run      Print offset only; do not run command
-      --probe        Try all methods and print each offset (recon / sanity check)
-  -h, --help         Print help
+  -m, --method <M>          Comma-separated source order. Default: kerberos,ntp,smb
+      --timeout <S>         Per-method timeout in seconds. Default: 3
+      --stealth-user <NAME> Principal name in the Kerberos AS-REQ probe. Default: admnistrator
+      --faketime-path <P>   Explicit path to the faketime binary
+  -v, --verbose             Show handshake details on stderr
+  -n, --dry-run             Print offset only; do not run command
+      --probe               Try all methods and print each offset (recon / sanity check)
+  -h, --help                Print help
 ```
 
 ### Examples
@@ -125,11 +127,17 @@ The first successful method wins. The binary passes `faketime -f "+X.XXXXXXs"` (
 
 ## OPSEC considerations
 
-| Method | Port | Protocol | What logs in the DC |
-|---|---|---|---|
-| Kerberos | TCP/88 | Kerberos AS-REQ | Security Event 4768 with `FailureCode: 0x6` (principal unknown) — indistinguishable from a user typo |
-| NTP | UDP/123 | SNTP | Typically nothing; Windows NTP service rarely logs client queries |
-| SMB | TCP/445 | SMB2 NEGOTIATE | A partial session (no login); may appear in SMB audit logs as an unsigned/anonymous negotiate |
+### Forensic noise per method
+
+| Method | Port | Protocol | What logs in the DC | Stealth rank |
+|---|---|---|---|---|
+| NTP | UDP/123 | SNTP | Nothing — W32Time does not log client queries in Security/System log | ★★★ (best) |
+| SMB | TCP/445 | SMB2 NEGOTIATE | A partial session (no auth); appears in SMB audit logs only if object-access auditing is enabled | ★★ |
+| Kerberos | TCP/88 | Kerberos AS-REQ | **Always** generates Security Event 4768 with `FailureCode: 0x6` (unknown principal) — exported to SIEM regardless of audit policy | ★ |
+
+**Why Kerberos is the default despite ranking last:** TCP/88 is the most reliably open port on any DC. NTP is often rate-limited or firewalled in hardened environments; TCP/445 may be blocked or require SMB3 encryption. The default `kerberos,ntp,smb` prioritises reliability — if you need maximum forensic stealth, pass `-m ntp,smb,kerberos` explicitly to try the quieter methods first.
+
+**Kerberos blend-in:** Event 4768/0x6 is generated but it blends into universal AD noise — any medium-sized environment sees dozens of these per hour from legitimate user typos. The `--stealth-user` flag (default: `admnistrator`) controls the principal name. Avoid `guest`: if the account is disabled, the failure code becomes `0x12` (disabled account), which is a SIGMA rule hit. Avoid obviously programmatic names like `nonexistent1234`. Plausible admin typos (`admnistrator`, `administator`) are the safest default.
 
 **Credential safety:** `--verbose` never logs your command's argv. If you run `skewrun -v dc -- impacket-getTGT REALM/user:PASSWORD`, the password does not appear in stderr.
 
@@ -137,10 +145,14 @@ The first successful method wins. The binary passes `faketime -f "+X.XXXXXXs"` (
 
 **FAST / armored Kerberos:** If the KDC requires pre-authentication armoring (FAST), the AS-REQ may be rejected without returning a parseable `KRB-ERROR`. `skewrun` will fall back to NTP automatically.
 
-### When NOT to use Kerberos mode
+### When to use max-stealth mode
 
-- Environment uses honeypot accounts that alert on any failed Kerberos attempt.
-- You want zero network contact with port 88 (use `-m ntp,smb`).
+```bash
+# NTP first, SMB second, Kerberos only as last resort
+skewrun 10.10.10.5 -r CORP.LOCAL -m ntp,smb,kerberos -- impacket-getTGT ...
+```
+
+Use this when the environment has aggressive SIEM rules, a known Kerberos honeypot, or when any Event 4768 is actively investigated.
 
 ---
 
@@ -149,6 +161,7 @@ The first successful method wins. The binary passes `faketime -f "+X.XXXXXXs"` (
 - **Linux only.** `libfaketime` relies on `LD_PRELOAD`; no equivalent on Windows. Windows users: use WSL.
 - **IPv4 only** in v1. IPv6 support is planned for v1.1.
 - **No Kerberos FAST armoring** for the AS-REQ probe. Falls back to NTP automatically when FAST is enforced.
+- **NTP Era 0 only.** The NTP parser assumes Era 0 (epoch 1900-01-01), which wraps on 2036-02-07. Era 1 detection is not implemented. In practice this is not a concern for a pentest tool, but timestamps from servers configured ahead of 2036 would be misinterpreted.
 
 ---
 

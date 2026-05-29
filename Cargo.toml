@@ -17,6 +17,7 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "1"
 rand = "0.8"
+which = "6"
 
 [profile.release]
 lto = true

@@ -41,6 +41,17 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     timeout: u64,
 
+    /// Principal name used in the Kerberos AS-REQ probe. A plausible admin typo
+    /// (default: "admnistrator") blends into the universal Event 4768/0x6 noise in AD.
+    /// Change this if the default is blocked or monitored in the target environment.
+    #[arg(long, default_value = "admnistrator")]
+    stealth_user: String,
+
+    /// Explicit path to the faketime binary. Falls back to $FAKETIME_BIN,
+    /// /usr/bin/faketime, PATH lookup (via which), then bare "faketime".
+    #[arg(long)]
+    faketime_path: Option<String>,
+
     /// Print handshake details to stderr. Command argv is never logged.
     #[arg(short, long)]
     verbose: bool,
@@ -77,22 +88,26 @@ fn main() -> anyhow::Result<()> {
     let realm = args.realm.or_else(read_realm_from_krb5_conf);
 
     if args.probe {
-        return run_probe(target, realm.as_deref(), timeout, &args.method);
+        return run_probe(target, realm.as_deref(), timeout, &args.method, &args.stealth_user);
     }
 
-    let sources = build_sources(&args.method, realm.as_deref());
+    let sources = build_sources(&args.method, realm.as_deref(), &args.stealth_user);
     let orchestrator = Orchestrator::new(sources, args.verbose);
 
     let (offset_us, method) = orchestrator.resolve(target, timeout)?;
     let fmt = format_offset(offset_us);
 
-    eprintln!("[{}] {}", method, fmt);
-
     if args.dry_run {
+        println!("[{}] {}", method, fmt);
         return Ok(());
     }
 
-    run_under_faketime(&fmt, &args.command)
+    if args.verbose {
+        eprintln!("[{}] {}", method, fmt);
+    }
+
+    let faketime_bin = resolve_faketime_bin(args.faketime_path.as_deref());
+    run_under_faketime(&fmt, &args.command, &faketime_bin)
 }
 
 fn run_probe(
@@ -100,8 +115,9 @@ fn run_probe(
     realm: Option<&str>,
     timeout: Duration,
     method_csv: &str,
+    stealth_user: &str,
 ) -> anyhow::Result<()> {
-    let sources = build_sources(method_csv, realm);
+    let sources = build_sources(method_csv, realm, stealth_user);
     let mut any_success = false;
 
     for src in &sources {
@@ -122,16 +138,16 @@ fn run_probe(
     Ok(())
 }
 
-fn build_sources(method_csv: &str, realm: Option<&str>) -> Vec<Box<dyn TimeSource>> {
+fn build_sources(method_csv: &str, realm: Option<&str>, stealth_user: &str) -> Vec<Box<dyn TimeSource>> {
     let mut sources: Vec<Box<dyn TimeSource>> = Vec::new();
 
     for method in method_csv.split(',').map(str::trim) {
         match method {
             "kerberos" => {
-                if let Some(r) = realm {
-                    sources.push(Box::new(KerberosSource { realm: r.to_owned() }));
-                }
-                // If no realm, silently skip Kerberos.
+                sources.push(Box::new(KerberosSource {
+                    realm: realm.map(str::to_owned),
+                    stealth_user: stealth_user.to_owned(),
+                }));
             }
             "ntp" => sources.push(Box::new(NtpSource)),
             "smb" => sources.push(Box::new(SmbSource)),
@@ -172,17 +188,39 @@ fn read_realm_from_krb5_conf() -> Option<String> {
     None
 }
 
-fn run_under_faketime(offset_fmt: &str, command: &[String]) -> anyhow::Result<()> {
+/// Resolve the faketime binary path: explicit flag → $FAKETIME_BIN → /usr/bin/faketime
+/// → PATH lookup → bare "faketime" (relies on caller's PATH).
+fn resolve_faketime_bin(explicit: Option<&str>) -> String {
+    if let Some(p) = explicit {
+        return p.to_owned();
+    }
+    if let Ok(p) = std::env::var("FAKETIME_BIN") {
+        if std::path::Path::new(&p).exists() {
+            return p;
+        }
+        eprintln!("[warn] FAKETIME_BIN={:?} does not exist, searching PATH", p);
+    }
+    let fixed = "/usr/bin/faketime";
+    if std::path::Path::new(fixed).exists() {
+        return fixed.to_owned();
+    }
+    if let Ok(p) = which::which("faketime") {
+        return p.to_string_lossy().into_owned();
+    }
+    "faketime".to_owned()
+}
+
+fn run_under_faketime(offset_fmt: &str, command: &[String], bin: &str) -> anyhow::Result<()> {
     let cmd_bin = &command[0];
     let cmd_args = &command[1..];
 
-    let status = Command::new("faketime")
+    let status = Command::new(bin)
         .arg("-f")
         .arg(offset_fmt)
         .arg(cmd_bin)
         .args(cmd_args)
         .status()
-        .with_context(|| "failed to spawn faketime — is libfaketime installed? (apt install faketime / pacman -S libfaketime)")?;
+        .with_context(|| format!("failed to spawn faketime ({bin}) — is libfaketime installed? (apt install faketime / pacman -S libfaketime)"))?;
 
     let code = status
         .code()
