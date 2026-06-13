@@ -1,17 +1,18 @@
 /// SMB2 NEGOTIATE time source — fallback on TCP/445.
+///
+/// Protocol Specifications:
+/// - **MS-SMB2 §2.2.3**: SMB2 NEGOTIATE Request
+/// - **MS-SMB2 §2.2.4**: SMB2 NEGOTIATE Response
+///
 /// Sends SMB2 NEGOTIATE request and reads SystemTime from the response.
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
-use rand::Rng;
-
-use crate::time_src::{OffsetMicros, TimeSourceError, TimeSource};
+use super::common::{filetime_to_system_time, system_time_to_us};
+use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct SmbSource;
-
-// Seconds between Windows FILETIME epoch (1601-01-01) and Unix epoch (1970-01-01).
-const FILETIME_TO_UNIX_SECS: u64 = 11_644_473_600;
 
 // SMB2 capabilities: DFS | LEASING | LARGE_MTU | MULTI_CHANNEL | PERSISTENT_HANDLES | DIR_LEASING | ENCRYPTION
 const SMB2_CAPABILITIES: u32 = 0x7F;
@@ -39,7 +40,9 @@ impl<'a> FieldReader<'a> {
 
     fn read_u64_le(&mut self) -> Result<u64, TimeSourceError> {
         let b = self.next_bytes(8)?;
-        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
 
     fn skip(&mut self, n: usize) -> Result<(), TimeSourceError> {
@@ -47,13 +50,17 @@ impl<'a> FieldReader<'a> {
         Ok(())
     }
 
-    fn next_bytes(&mut self, n: usize) -> Result<&[u8], TimeSourceError> {
-        if self.pos + n > self.buf.len() {
-            return Err(TimeSourceError::Parse("NEGOTIATE_RESPONSE truncated".into()));
+    fn next_bytes(&mut self, n: usize) -> Result<&'a [u8], TimeSourceError> {
+        let end = self
+            .pos
+            .checked_add(n)
+            .ok_or_else(|| TimeSourceError::Parse("FieldReader overflow".into()))?;
+        if end > self.buf.len() {
+            return Err(TimeSourceError::Parse("SMB body overruns buffer".into()));
         }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
+        let b = &self.buf[self.pos..end];
+        self.pos = end;
+        Ok(b)
     }
 }
 
@@ -62,7 +69,11 @@ impl TimeSource for SmbSource {
         "smb"
     }
 
-    fn fetch(&self, target: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
+    fn fetch(
+        &self,
+        target: SocketAddr,
+        timeout: Duration,
+    ) -> Result<OffsetMicros, TimeSourceError> {
         let smb_addr: SocketAddr = (target.ip(), 445).into();
         fetch_smb(smb_addr, timeout)
     }
@@ -70,14 +81,20 @@ impl TimeSource for SmbSource {
 
 fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
     let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(map_io_err)?;
-    stream.set_read_timeout(Some(timeout)).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
-    stream.set_write_timeout(Some(timeout)).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
 
     let t_send = Instant::now();
     let t_send_sys = SystemTime::now();
 
     let request = build_negotiate_request();
-    stream.write_all(&request).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
+    stream
+        .write_all(&request)
+        .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
 
     // Read NetBIOS header (4 bytes) to know response length.
     let mut nb_header = [0u8; 4];
@@ -85,10 +102,16 @@ fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
     // NetBIOS session message: byte 0 = 0x00, bytes 1..4 = 24-bit big-endian length.
     let msg_len = u32::from_be_bytes(nb_header) & 0x00FF_FFFF;
     if msg_len > 65536 {
-        return Err(TimeSourceError::Protocol(format!("implausibly large SMB2 response: {} bytes", msg_len)));
+        return Err(TimeSourceError::Protocol(format!(
+            "implausibly large SMB2 response: {} bytes",
+            msg_len
+        )));
     }
     if msg_len < 64 + 65 {
-        return Err(TimeSourceError::Parse(format!("SMB2 response too short: {} bytes", msg_len)));
+        return Err(TimeSourceError::Parse(format!(
+            "SMB2 response too short: {} bytes",
+            msg_len
+        )));
     }
 
     let mut body = vec![0u8; msg_len as usize];
@@ -102,16 +125,16 @@ fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
 
     // Single-point approximation: server timestamp ≈ midpoint of our send/recv window.
     // Precision: ±RTT/2 — sufficient for Kerberos 5-minute skew window.
-    let t_mid_us = system_time_to_us(t_send_sys) + (rtt.as_micros() as i64) / 2;
-    let server_us = system_time_to_us(server_time);
+    let t_mid_us = system_time_to_us(t_send_sys)? + (rtt.as_micros() as i64) / 2;
+    let server_us = system_time_to_us(server_time)?;
 
     Ok(server_us - t_mid_us)
 }
 
 /// Build SMB2 NEGOTIATE request wrapped in a NetBIOS session message.
 fn build_negotiate_request() -> Vec<u8> {
-    // Dialects: SMB 3.1.1, 3.0, 2.1, 2.0.2 — include 3.1.1 to avoid "Legacy Protocol" alerts.
-    let dialects: &[u16] = &[0x0311, 0x0300, 0x0210, 0x0202];
+    // Dialects: SMB 3.0, 2.1, 2.0.2. Dropped 3.1.1 because it requires Negotiate Contexts to be OPSEC safe.
+    let dialects: &[u16] = &[0x0300, 0x0210, 0x0202];
     let dialect_count = dialects.len() as u16;
 
     // SMB2 NEGOTIATE request body (MS-SMB2 §2.2.3):
@@ -147,12 +170,16 @@ fn build_negotiate_request() -> Vec<u8> {
     b[0..2].copy_from_slice(&36u16.to_le_bytes());
     // DialectCount
     b[2..4].copy_from_slice(&dialect_count.to_le_bytes());
-    // SecurityMode = 0 (signing not required from client side)
-    b[4..6].copy_from_slice(&0u16.to_le_bytes());
+    // SecurityMode = 1 (signing enabled, but not required - matches Windows default)
+    b[4..6].copy_from_slice(&1u16.to_le_bytes());
     b[8..12].copy_from_slice(&SMB2_CAPABILITIES.to_le_bytes());
-    // ClientGuid: randomise to avoid IOC (all-zero GUID is a trivial Suricata/Zeek signature).
+    // OPSEC: Random ClientGuid (UUIDv4)
     let mut guid = [0u8; 16];
-    rand::thread_rng().fill(&mut guid);
+    for b_out in guid.iter_mut() {
+        *b_out = rand::random();
+    }
+    guid[6] = (guid[6] & 0x0F) | 0x40; // Version 4
+    guid[8] = (guid[8] & 0x3F) | 0x80; // Variant 10xx
     b[12..28].copy_from_slice(&guid);
     // Dialects start at offset 36 from body start
     for (i, &d) in dialects.iter().enumerate() {
@@ -167,16 +194,16 @@ fn build_negotiate_request() -> Vec<u8> {
 fn parse_negotiate_response(b: &[u8]) -> Result<SystemTime, TimeSourceError> {
     let mut r = FieldReader::new(b);
     // Fields are little-endian; read sequentially per MS-SMB2 §2.2.4.
-    let structure_size      = r.read_u16_le()?; //  0: StructureSize (must be 65)
-    let _security_mode      = r.read_u16_le()?; //  2: SecurityMode
-    let _dialect_revision   = r.read_u16_le()?; //  4: DialectRevision
-    let _negotiate_ctx_cnt  = r.read_u16_le()?; //  6: NegotiateContextCount/Reserved
-    r.skip(16)?;                                 //  8: ServerGuid ([u8; 16])
-    let _capabilities       = r.read_u32_le()?; // 24: Capabilities
-    let _max_transact       = r.read_u32_le()?; // 28: MaxTransactSize
-    let _max_read           = r.read_u32_le()?; // 32: MaxReadSize
-    let _max_write          = r.read_u32_le()?; // 36: MaxWriteSize
-    let system_time         = r.read_u64_le()?; // 40: SystemTime (FILETIME)
+    let structure_size = r.read_u16_le()?; //  0: StructureSize (must be 65)
+    let _security_mode = r.read_u16_le()?; //  2: SecurityMode
+    let _dialect_revision = r.read_u16_le()?; //  4: DialectRevision
+    let _negotiate_ctx_cnt = r.read_u16_le()?; //  6: NegotiateContextCount/Reserved
+    r.skip(16)?; //  8: ServerGuid ([u8; 16])
+    let _capabilities = r.read_u32_le()?; // 24: Capabilities
+    let _max_transact = r.read_u32_le()?; // 28: MaxTransactSize
+    let _max_read = r.read_u32_le()?; // 32: MaxReadSize
+    let _max_write = r.read_u32_le()?; // 36: MaxWriteSize
+    let system_time = r.read_u64_le()?; // 40: SystemTime (FILETIME)
 
     if structure_size != 65 {
         return Err(TimeSourceError::Protocol(format!(
@@ -186,29 +213,6 @@ fn parse_negotiate_response(b: &[u8]) -> Result<SystemTime, TimeSourceError> {
     }
 
     filetime_to_system_time(system_time)
-}
-
-/// Convert Windows FILETIME (100ns ticks since 1601-01-01 UTC) to SystemTime.
-fn filetime_to_system_time(filetime: u64) -> Result<SystemTime, TimeSourceError> {
-    // Offset from FILETIME epoch to Unix epoch in 100ns ticks.
-    const EPOCH_OFFSET_100NS: u64 = FILETIME_TO_UNIX_SECS * 10_000_000;
-
-    if filetime < EPOCH_OFFSET_100NS {
-        return Err(TimeSourceError::Parse(format!(
-            "FILETIME {} predates Unix epoch",
-            filetime
-        )));
-    }
-    let unix_100ns = filetime - EPOCH_OFFSET_100NS;
-    let secs = unix_100ns / 10_000_000;
-    let nanos = ((unix_100ns % 10_000_000) * 100) as u32;
-    Ok(UNIX_EPOCH + Duration::new(secs, nanos))
-}
-
-fn system_time_to_us(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 fn map_io_err(e: std::io::Error) -> TimeSourceError {
@@ -223,6 +227,7 @@ fn map_io_err(e: std::io::Error) -> TimeSourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::UNIX_EPOCH;
 
     #[test]
     fn filetime_unix_epoch() {
@@ -267,7 +272,11 @@ mod tests {
         // ClientGuid is at offset 4 (NetBIOS) + 64 (SMB2 header) + 12 (body offset) = 80..96
         let r1 = build_negotiate_request();
         let r2 = build_negotiate_request();
-        assert_ne!(&r1[80..96], &r2[80..96], "ClientGuid must differ between calls");
+        assert_ne!(
+            &r1[80..96],
+            &r2[80..96],
+            "ClientGuid must differ between calls"
+        );
         // Sanity: neither is all-zero (overwhelmingly probable)
         assert_ne!(&r1[80..96], &[0u8; 16]);
     }

@@ -1,186 +1,88 @@
-# skewrun
+# Skewrun
 
 [![CI](https://github.com/joaov-botelho/skewrun/actions/workflows/ci.yml/badge.svg)](https://github.com/joaov-botelho/skewrun/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+[![Crates.io](https://img.shields.io/crates/v/skewrun.svg)](https://crates.io/crates/skewrun)
 
-Queries a target server's clock via **Kerberos → NTP → SMB** (in that order, with automatic fallback) and runs a command under [`libfaketime`](https://github.com/wolfcw/libfaketime) with the correct time offset.
+`skewrun` is an Active Directory time discovery toolkit for red teams. It dynamically resolves the Domain Controller's time via network protocols (CLDAP, SMB, NTP, Kerberos, NTLM) and executes commands via `libfaketime` (`LD_PRELOAD`), tricking the executed binary into using the exact DC time.
 
-Built for Active Directory pentest workflows where `KRB_AP_ERR_SKEW` blocks Kerberos auth because your attacker clock diverges from the DC by more than 5 minutes.
+This solves the Kerberos `KRB_AP_ERR_SKEW` (Clock Skew Too Great) error, allowing you to run tools like Impacket or NetExec from a Linux attack machine whose clock is heavily desynchronized from the target Windows domain, **without requiring root privileges to change the system time**.
 
----
+## Architecture: Library-First
 
-## Why not `ntpdate`?
+Starting with `v0.9.0`, Skewrun is built as a library-first architecture:
+- **`ad-time`**: A pure Rust library crate that extracts time from AD protocols stealthily. It can be natively embedded into other Rust implants or tools.
+- **`skewrun`**: A CLI binary that orchestrates the `ad-time` library and wraps target processes with `libfaketime`.
 
-| | `ntpdate` + bash | `faketime-ad` | **skewrun** |
-|---|---|---|---|
-| Time source | NTP only | SMB via nmap | Kerberos · NTP · SMB |
-| External deps | `ntpdate` binary | `nmap` | none (beyond `faketime`) |
-| Binary | bash script | bash script | static musl binary |
-| Fallback | no | no | automatic |
-| NTP blocked? | fails | works | Kerberos first; SMB fallback |
-| SMB port closed? | works | fails | falls back to Kerberos/NTP |
+## Installation
 
----
+```bash
+# Pre-built static binary (no Rust toolchain required)
+wget https://github.com/joaov-botelho/skewrun/releases/latest/download/skewrun-x86_64-linux-musl
+chmod +x skewrun-x86_64-linux-musl
+sudo mv skewrun-x86_64-linux-musl /usr/local/bin/skewrun
 
-## Install
+# From crates.io
+cargo install skewrun
 
-### Download a pre-built static binary
-
-```
-wget https://github.com/joaov-botelho/skewrun/releases/latest/download/skewrun-x86_64-linux
-chmod +x skewrun-x86_64-linux && sudo mv skewrun-x86_64-linux /usr/local/bin/skewrun
+# From source
+git clone https://github.com/joaov-botelho/skewrun && cd skewrun && cargo build --release
 ```
 
-### Build from source
-
-```
-git clone https://github.com/joaov-botelho/skewrun
-cd skewrun
-cargo build --release
-```
-
-#### Static musl binary (portable across distros)
-
-```
-# Install musl target
-rustup target add x86_64-unknown-linux-musl
-sudo apt install musl-tools   # or: pacman -S musl
-
-cargo build --release --target x86_64-unknown-linux-musl
-# Binary at: target/x86_64-unknown-linux-musl/release/skewrun
-```
-
-#### Prerequisite: libfaketime
-
-```
-# Kali / Debian / Ubuntu
-sudo apt install faketime
-
-# Arch
-sudo pacman -S libfaketime
-
-# Fedora
-sudo dnf install libfaketime
-```
-
----
+*Note: You must have `libfaketime` installed on your system (e.g., `apt-get install libfaketime`).*
 
 ## Usage
 
-```
-skewrun [OPTIONS] <TARGET> -- <COMMAND>...
-```
-
-```
-ARGS:
-  <TARGET>           IP or hostname of the DC / target server
-  <COMMAND>...       Command and arguments to run (everything after --)
-
-OPTIONS:
-  -r, --realm <R>    Kerberos realm (e.g. CORP.LOCAL)
-                     Falls back to $KRB5_CONFIG / /etc/krb5.conf if absent
-  -m, --method <M>          Comma-separated source order. Default: kerberos,ntp,smb
-      --timeout <S>         Per-method timeout in seconds. Default: 3
-      --stealth-user <NAME> Principal name in the Kerberos AS-REQ probe. Default: admnistrator
-      --faketime-path <P>   Explicit path to the faketime binary
-  -v, --verbose             Show handshake details on stderr
-  -n, --dry-run             Print offset only; do not run command
-      --probe               Try all methods and print each offset (recon / sanity check)
-  -h, --help                Print help
-```
-
-### Examples
-
 ```bash
-# Typical AD workflow — impacket tool with Kerberos auth
-skewrun 10.10.10.5 -r CORP.LOCAL -- impacket-getTGT CORP.LOCAL/svc_account:Password1
+# Default behavior (tries CLDAP -> SMB -> NTP)
+skewrun 10.10.10.100 -- impacket-getTGT -dc-ip 10.10.10.100 domain.local/user:pass
 
-# Equivalent with BloodHound.py
-skewrun 10.10.10.5 -r CORP.LOCAL -- bloodhound-python -c All -u alice -p 'P@ss' -d corp.local -dc 10.10.10.5
+# Force specific methods
+skewrun 10.10.10.100 -m cldap,ntlm,kerberos -- netexec smb 10.10.10.100
 
-# Probe all methods without running a command (useful for recon)
-skewrun 10.10.10.5 --probe
+# Just print the offset (useful for shell scripting)
+skewrun 10.10.10.100 --print-offset
 
-# Dry-run: print the computed offset and faketime format
-skewrun 10.10.10.5 -r CORP.LOCAL -n
-
-# Force NTP only (skip Kerberos and SMB)
-skewrun 10.10.10.5 -m ntp -- impacket-getTGT ...
-
-# Verbose: shows which method succeeded and the raw offset
-skewrun 10.10.10.5 -r CORP.LOCAL -v -- impacket-getTGT ...
+# Offline mode: supply a known offset manually
+skewrun --offset "+3.450s" -- impacket-getTGT ...
 ```
 
----
+## Using as a library
 
-## How it works
+```rust
+use ad_time::protocols::cldap::CldapSource;
+use ad_time::time_src::TimeSource;
+use std::time::Duration;
 
-1. **Kerberos (primary, stealth)** — Sends a minimal `AS-REQ` for a nonexistent principal. Any KDC responds with a `KRB-ERROR` that includes `stime` (server timestamp) in required fields per RFC 4120. Reads the two fields from the error and computes `offset = server_time - local_midpoint`. Precision: ±RTT/2 (well within the 5-minute Kerberos window). Skipped if `--realm` is not provided and cannot be read from `krb5.conf`.
-
-2. **NTP (fallback 1)** — Standard SNTP mode 3 query (RFC 4330) on UDP/123. Full four-point `((t2-t1)+(t3-t4))/2` offset calculation.
-
-3. **SMB (fallback 2)** — Sends an `SMB2 NEGOTIATE` request (dialects 3.1.1, 3.0, 2.1, 2.0.2) and reads `SystemTime` from the `NEGOTIATE_RESPONSE`. Converts FILETIME to Unix time. Single-point approximation ±RTT/2.
-
-The first successful method wins. The binary passes `faketime -f "+X.XXXXXXs"` (relative offset, time ticks normally) as a transparent wrapper around your command, inheriting stdin/stdout/stderr and propagating the exit code exactly.
-
----
-
-## OPSEC considerations
-
-### Forensic noise per method
-
-| Method | Port | Protocol | What logs in the DC | Stealth rank |
-|---|---|---|---|---|
-| NTP | UDP/123 | SNTP | Nothing — W32Time does not log client queries in Security/System log | ★★★ (best) |
-| SMB | TCP/445 | SMB2 NEGOTIATE | A partial session (no auth); appears in SMB audit logs only if object-access auditing is enabled | ★★ |
-| Kerberos | TCP/88 | Kerberos AS-REQ | **Always** generates Security Event 4768 with `FailureCode: 0x6` (unknown principal) — exported to SIEM regardless of audit policy | ★ |
-
-**Why Kerberos is the default despite ranking last:** TCP/88 is the most reliably open port on any DC. NTP is often rate-limited or firewalled in hardened environments; TCP/445 may be blocked or require SMB3 encryption. The default `kerberos,ntp,smb` prioritises reliability — if you need maximum forensic stealth, pass `-m ntp,smb,kerberos` explicitly to try the quieter methods first.
-
-**Kerberos blend-in:** Event 4768/0x6 is generated but it blends into universal AD noise — any medium-sized environment sees dozens of these per hour from legitimate user typos. The `--stealth-user` flag (default: `admnistrator`) controls the principal name. Avoid `guest`: if the account is disabled, the failure code becomes `0x12` (disabled account), which is a SIGMA rule hit. Avoid obviously programmatic names like `nonexistent1234`. Plausible admin typos (`admnistrator`, `administator`) are the safest default.
-
-**Credential safety:** `--verbose` never logs your command's argv. If you run `skewrun -v dc -- impacket-getTGT REALM/user:PASSWORD`, the password does not appear in stderr.
-
-**LD_PRELOAD restriction:** `libfaketime` uses `LD_PRELOAD`. The Linux kernel strips `LD_PRELOAD` for setuid/setgid binaries — the offset will be silently ignored. This doesn't affect Python-based tools (impacket, bloodhound-python) or most pentest binaries.
-
-**FAST / armored Kerberos:** If the KDC requires pre-authentication armoring (FAST), the AS-REQ may be rejected without returning a parseable `KRB-ERROR`. `skewrun` will fall back to NTP automatically.
-
-### When to use max-stealth mode
-
-```bash
-# NTP first, SMB second, Kerberos only as last resort
-skewrun 10.10.10.5 -r CORP.LOCAL -m ntp,smb,kerberos -- impacket-getTGT ...
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let src = CldapSource;
+    let addr = "10.10.10.100:389".parse()?;
+    let offset_us = src.fetch(addr, Duration::from_secs(3))?;
+    println!("DC offset: {} µs", offset_us);
+    Ok(())
+}
 ```
 
-Use this when the environment has aggressive SIEM rules, a known Kerberos honeypot, or when any Event 4768 is actively investigated.
+Each protocol module (`kerberos`, `ntlm`, `cldap`, `smb`, `ntp`) is independent and extractable for use in custom red team tooling.
 
----
+## How It Works
 
-## Known limitations
+Skewrun queries the DC to calculate the exact microsecond offset `(DC_Time - Local_Time)`. It then sets the `FAKETIME` environment variable and injects `libfaketime` into the target command using `LD_PRELOAD`.
 
-- **Linux only.** `libfaketime` relies on `LD_PRELOAD`; no equivalent on Windows. Windows users: use WSL.
-- **IPv4 only** in v1. IPv6 support is planned for v1.1.
-- **No Kerberos FAST armoring** for the AS-REQ probe. Falls back to NTP automatically when FAST is enforced.
-- **NTP Era 0 only.** The NTP parser assumes Era 0 (epoch 1900-01-01), which wraps on 2036-02-07. Era 1 detection is not implemented. In practice this is not a concern for a pentest tool, but timestamps from servers configured ahead of 2036 would be misinterpreted.
+### FAKETIME limitations (Static Binaries)
+`LD_PRELOAD` relies on intercepting `libc` dynamically linked calls (like `clock_gettime`). If you attempt to use `skewrun` on a **statically compiled binary** (such as many Go or Rust tools), `libfaketime` will silently fail to hook the time functions. Skewrun will warn you if it detects you are attempting to run a static binary.
 
----
+## Forensic Noise & Evasion
 
-## Building for aarch64
+The goal is to blend in with standard Windows wire traffic and minimize forensic footprint on the DC. 
 
-```bash
-rustup target add aarch64-unknown-linux-musl
-sudo apt install gcc-aarch64-linux-gnu
-
-cat >> ~/.cargo/config.toml <<'EOF'
-[target.aarch64-unknown-linux-musl]
-linker = "aarch64-linux-gnu-gcc"
-EOF
-
-cargo build --release --target aarch64-unknown-linux-musl
-```
-
----
+| Method | Protocol | Port | OPSEC Notes (EDR/NDR Visibility) |
+|--------|----------|------|-----------------------------------|
+| **cldap** (Default) | CLDAP | UDP/389 | **Extremely Stealthy**. Universally allowed. Emulates a standard Windows DC Locator Ping (`rootDSE`). Dilutes the attribute query and randomizes TimeLimits to evade NDRs. |
+| **smb** (Default) | SMB2 | TCP/445 | **Stealthy**. Extracts time from the `SMB2 NEGOTIATE` response. Plausible workstation noise. |
+| **ntp** (Default) | SNTP | UDP/123 | **Standard**. Native RFC 4330. Highly expected traffic from any client. |
+| **ntlm** | SMB2 | TCP/445 | **Stealthy**. Exploits `SMB2 SESSION_SETUP` to get an NTLM Type 2 Challenge containing `MsvAvTimestamp`. Disconnects TCP before Type 3, meaning **no Event ID 4625 (Logon Failure) is generated**. Emulates Windows 10/11 flags. |
+| **kerberos** | Kerberos | TCP/88 | **Loud**. Sends an `AS-REQ` for a non-existent user. Encodes proper two-component `sname`, rotates `cname` (typos like *admnistrator*), `till` (10h ± 30min jitter), `nonce`, and `ClientGuid` to blend in. Always generates Event 4768/0x6 (pre-authentication failure for unknown principal) which is exported to SIEM regardless of audit policy. May trigger honey-account alerts if the `cname` matches a configured tripwire. |
 
 ## License
 
-Licensed under either of [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE) at your option.
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE-APACHE) at your option.
