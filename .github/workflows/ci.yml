@@ -52,7 +52,9 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install cross
-        uses: taiki-e/install-action@cross
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
       - name: Build
-        run: cross build --release --target ${{ matrix.target }} --workspace
+        run: cargo zigbuild --release --target ${{ matrix.target }} --workspace
