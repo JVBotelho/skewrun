@@ -1,6 +1,6 @@
 # Skewrun
 
-[![CI](https://github.com/joaov-botelho/skewrun/actions/workflows/ci.yml/badge.svg)](https://github.com/joaov-botelho/skewrun/actions/workflows/ci.yml)
+[![CI](https://github.com/JVBotelho/skewrun/actions/workflows/ci.yml/badge.svg)](https://github.com/JVBotelho/skewrun/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/skewrun.svg)](https://crates.io/crates/skewrun)
 
 `skewrun` is an Active Directory time discovery toolkit for red teams. It dynamically resolves the Domain Controller's time via network protocols (CLDAP, SMB, NTP, Kerberos, NTLM) and executes commands via `libfaketime` (`LD_PRELOAD`), tricking the executed binary into using the exact DC time.
@@ -17,7 +17,7 @@ Starting with `v0.9.0`, Skewrun is built as a library-first architecture:
 
 ```bash
 # Pre-built static binary (no Rust toolchain required)
-wget https://github.com/joaov-botelho/skewrun/releases/latest/download/skewrun-x86_64-linux-musl
+wget https://github.com/JVBotelho/skewrun/releases/latest/download/skewrun-x86_64-linux-musl
 chmod +x skewrun-x86_64-linux-musl
 sudo mv skewrun-x86_64-linux-musl /usr/local/bin/skewrun
 
@@ -25,7 +25,7 @@ sudo mv skewrun-x86_64-linux-musl /usr/local/bin/skewrun
 cargo install skewrun
 
 # From source
-git clone https://github.com/joaov-botelho/skewrun && cd skewrun && cargo build --release
+git clone https://github.com/JVBotelho/skewrun && cd skewrun && cargo build --release
 ```
 
 *Note: You must have `libfaketime` installed on your system (e.g., `apt-get install libfaketime`).*

@@ -53,6 +53,6 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Install cross
-        run: cargo install cross
+        uses: taiki-e/install-action@cross
       - name: Build
         run: cross build --release --target ${{ matrix.target }} --workspace

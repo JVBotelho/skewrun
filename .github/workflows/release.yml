@@ -24,7 +24,7 @@ jobs:
         targets: ${{ matrix.target }}
 
     - name: Install cross
-      run: cargo install cross
+      uses: taiki-e/install-action@cross
 
     - name: Build with cross
       run: cross build --release --target ${{ matrix.target }} --package skewrun
