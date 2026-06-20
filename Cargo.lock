@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "ad-time"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "thiserror",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -256,10 +264,10 @@ dependencies = [
 name = "skewrun"
 version = "0.1.0"
 dependencies = [
+ "ad-time",
  "anyhow",
  "clap",
  "rand",
- "thiserror",
  "which",
 ]
 

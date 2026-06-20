@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 use std::net::ToSocketAddrs;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
 use std::time::Duration;
@@ -8,15 +9,21 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Parser;
 
-mod kerberos;
-mod ntp;
-mod smb;
-mod time_src;
+use ad_time::protocols::cldap::CldapSource;
+use ad_time::protocols::kerberos::KerberosSource;
+use ad_time::protocols::ntlm::NtlmSource;
+use ad_time::protocols::ntp::NtpSource;
+use ad_time::protocols::smb::SmbSource;
+use ad_time::time_src::{format_offset, Orchestrator, TimeSource};
+use rand::seq::SliceRandom;
 
-use kerberos::KerberosSource;
-use ntp::NtpSource;
-use smb::SmbSource;
-use time_src::{format_offset, Orchestrator, TimeSource};
+const STEALTH_USERS_POOL: &[&str] = &[
+    "admnistrator",
+    "administator",
+    "admimistrator",
+    "amdinistrator",
+    "admin1strator",
+];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,8 +40,8 @@ struct Args {
     #[arg(short, long)]
     realm: Option<String>,
 
-    /// Comma-separated list of time sources in order. Default: kerberos,ntp,smb
-    #[arg(short, long, default_value = "kerberos,ntp,smb")]
+    /// Comma-separated list of time sources in order. Default: cldap,smb,ntp
+    #[arg(short, long, default_value = "cldap,smb,ntp")]
     method: String,
 
     /// Timeout per method in seconds
@@ -42,10 +49,10 @@ struct Args {
     timeout: u64,
 
     /// Principal name used in the Kerberos AS-REQ probe. A plausible admin typo
-    /// (default: "admnistrator") blends into the universal Event 4768/0x6 noise in AD.
+    /// (default: random pick from pool) blends into the universal Event 4768/0x6 noise in AD.
     /// Change this if the default is blocked or monitored in the target environment.
-    #[arg(long, default_value = "admnistrator")]
-    stealth_user: String,
+    #[arg(long)]
+    stealth_user: Option<String>,
 
     /// Explicit path to the faketime binary. Falls back to $FAKETIME_BIN,
     /// /usr/bin/faketime, PATH lookup (via which), then bare "faketime".
@@ -56,9 +63,13 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
-    /// Only calculate and print offset; do not run command
-    #[arg(short = 'n', long)]
-    dry_run: bool,
+    /// Only calculate and print the offset; do not run a command
+    #[arg(short = 'p', long)]
+    print_offset: bool,
+
+    /// Skip network probe and use an explicit offset string (e.g. "+3.45s")
+    #[arg(short = 'o', long)]
+    offset: Option<String>,
 
     /// Probe all methods and report each offset (useful for recon / honeypot detection)
     #[arg(long)]
@@ -72,8 +83,8 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    if !args.dry_run && !args.probe && args.command.is_empty() {
-        anyhow::bail!("provide a command to run (after --), or use --dry-run / --probe");
+    if !args.print_offset && !args.probe && args.command.is_empty() {
+        anyhow::bail!("provide a command to run (after --), or use --print-offset / --probe");
     }
 
     let timeout = Duration::from_secs(args.timeout);
@@ -87,23 +98,39 @@ fn main() -> anyhow::Result<()> {
 
     let realm = args.realm.or_else(read_realm_from_krb5_conf);
 
+    let stealth_user = args.stealth_user.unwrap_or_else(|| {
+        let mut rng = rand::thread_rng();
+        STEALTH_USERS_POOL.choose(&mut rng).unwrap().to_string()
+    });
+
     if args.probe {
-        return run_probe(target, realm.as_deref(), timeout, &args.method, &args.stealth_user);
+        return run_probe(
+            target,
+            realm.as_deref(),
+            timeout,
+            &args.method,
+            &stealth_user,
+        );
     }
 
-    let sources = build_sources(&args.method, realm.as_deref(), &args.stealth_user);
-    let orchestrator = Orchestrator::new(sources, args.verbose);
+    let fmt = match args.offset {
+        Some(o) => o,
+        None => {
+            let sources = build_sources(&args.method, realm.as_deref(), &stealth_user);
+            let orchestrator = Orchestrator::new(sources, args.verbose);
 
-    let (offset_us, method) = orchestrator.resolve(target, timeout)?;
-    let fmt = format_offset(offset_us);
+            let (offset_us, method) = orchestrator.resolve(target, timeout)?;
+            let f = format_offset(offset_us);
+            if args.verbose {
+                eprintln!("[{}] {}", method, f);
+            }
+            f
+        }
+    };
 
-    if args.dry_run {
-        println!("[{}] {}", method, fmt);
+    if args.print_offset {
+        println!("{}", fmt);
         return Ok(());
-    }
-
-    if args.verbose {
-        eprintln!("[{}] {}", method, fmt);
     }
 
     let faketime_bin = resolve_faketime_bin(args.faketime_path.as_deref());
@@ -138,7 +165,11 @@ fn run_probe(
     Ok(())
 }
 
-fn build_sources(method_csv: &str, realm: Option<&str>, stealth_user: &str) -> Vec<Box<dyn TimeSource>> {
+fn build_sources(
+    method_csv: &str,
+    realm: Option<&str>,
+    stealth_user: &str,
+) -> Vec<Box<dyn TimeSource>> {
     let mut sources: Vec<Box<dyn TimeSource>> = Vec::new();
 
     for method in method_csv.split(',').map(str::trim) {
@@ -149,6 +180,8 @@ fn build_sources(method_csv: &str, realm: Option<&str>, stealth_user: &str) -> V
                     stealth_user: stealth_user.to_owned(),
                 }));
             }
+            "cldap" => sources.push(Box::new(CldapSource)),
+            "ntlm" => sources.push(Box::new(NtlmSource)),
             "ntp" => sources.push(Box::new(NtpSource)),
             "smb" => sources.push(Box::new(SmbSource)),
             other => eprintln!("[warn] unknown method '{}', ignoring", other),
@@ -214,6 +247,20 @@ fn run_under_faketime(offset_fmt: &str, command: &[String], bin: &str) -> anyhow
     let cmd_bin = &command[0];
     let cmd_args = &command[1..];
 
+    // OPSEC / UX: Warn if the target binary is statically linked.
+    // LD_PRELOAD (faketime) often fails on static binaries (like Go) that bypass libc.
+    if let Ok(file_out) = Command::new("file").arg(cmd_bin).output() {
+        let out_str = String::from_utf8_lossy(&file_out.stdout);
+        if out_str.contains("statically linked") {
+            eprintln!(
+                "[warn] target '{}' appears to be statically linked.",
+                cmd_bin
+            );
+            eprintln!("       LD_PRELOAD (faketime) may have no effect if the binary bypasses");
+            eprintln!("       libc time syscalls (common in Go-built tools).");
+        }
+    }
+
     let status = Command::new(bin)
         .arg("-f")
         .arg(offset_fmt)
@@ -222,9 +269,12 @@ fn run_under_faketime(offset_fmt: &str, command: &[String], bin: &str) -> anyhow
         .status()
         .with_context(|| format!("failed to spawn faketime ({bin}) — is libfaketime installed? (apt install faketime / pacman -S libfaketime)"))?;
 
+    #[cfg(unix)]
     let code = status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1));
+    #[cfg(not(unix))]
+    let code = status.code().unwrap_or(1);
 
     std::process::exit(code);
 }

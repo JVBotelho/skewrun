@@ -1,5 +1,11 @@
 /// Kerberos time source (primary — stealth).
 ///
+/// Protocol Specifications:
+/// - **RFC 4120 §3.1.1**: AS Exchange
+/// - **RFC 4120 §5.4.1**: KRB_AS_REQ
+/// - **RFC 4120 §5.9.1**: KRB_ERROR
+/// - **RFC 4120 §5.2.2**: PrincipalName
+///
 /// Sends a minimal AS-REQ for a nonexistent principal and reads `stime`/`susec`
 /// from the KRB-ERROR response. Any KRB-ERROR from a real KDC includes these
 /// required fields (RFC 4120 §5.9.1), so even a KRB_AP_ERR_PRINCIPAL_UNKNOWN
@@ -13,13 +19,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
 
-use crate::time_src::{OffsetMicros, TimeSourceError, TimeSource};
+use super::common::{parse_generalized_time, system_time_to_us};
+use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
-// DER/ASN.1 tag constants used in KRB-ERROR parsing.
+// DER/ASN.1 tag constants used in KRB-ERROR parsing (RFC 4120 §5.9.1).
 const KRB_ERROR_TAG: u8 = 0x7E; // APPLICATION 30
 const SEQUENCE_TAG: u8 = 0x30;
-const STIME_TAG: u8 = 0xA4;     // context [4]
-const SUSEC_TAG: u8 = 0xA5;     // context [5]
+const STIME_TAG: u8 = 0xA4; // context [4]
+const SUSEC_TAG: u8 = 0xA5; // context [5]
 const GENERALIZED_TIME_TAG: u8 = 0x18;
 const INTEGER_TAG: u8 = 0x02;
 
@@ -33,18 +40,33 @@ impl TimeSource for KerberosSource {
         "kerberos"
     }
 
-    fn fetch(&self, target: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
-        let realm = self.realm.as_deref()
+    fn fetch(
+        &self,
+        target: SocketAddr,
+        timeout: Duration,
+    ) -> Result<OffsetMicros, TimeSourceError> {
+        let realm = self
+            .realm
+            .as_deref()
             .ok_or_else(|| TimeSourceError::Config("no realm configured".into()))?;
         let krb_addr: SocketAddr = (target.ip(), 88).into();
         fetch_kerberos(krb_addr, realm, &self.stealth_user, timeout)
     }
 }
 
-fn fetch_kerberos(addr: SocketAddr, realm: &str, stealth_user: &str, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
+fn fetch_kerberos(
+    addr: SocketAddr,
+    realm: &str,
+    stealth_user: &str,
+    timeout: Duration,
+) -> Result<OffsetMicros, TimeSourceError> {
     let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(map_io_err)?;
-    stream.set_read_timeout(Some(timeout)).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
-    stream.set_write_timeout(Some(timeout)).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
 
     let t_send_sys = SystemTime::now();
     let t_send = Instant::now();
@@ -52,8 +74,12 @@ fn fetch_kerberos(addr: SocketAddr, realm: &str, stealth_user: &str, timeout: Du
     let req = build_as_req(realm, stealth_user);
     // RFC 4120 §7.2.2: TCP Kerberos messages are prefixed by 4-byte big-endian length.
     let len = (req.len() as u32).to_be_bytes();
-    stream.write_all(&len).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
-    stream.write_all(&req).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
+    stream
+        .write_all(&len)
+        .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
+    stream
+        .write_all(&req)
+        .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
 
     // Read response length prefix.
     let mut len_buf = [0u8; 4];
@@ -61,7 +87,10 @@ fn fetch_kerberos(addr: SocketAddr, realm: &str, stealth_user: &str, timeout: Du
     let resp_len = u32::from_be_bytes(len_buf) as usize;
 
     if resp_len > 65536 {
-        return Err(TimeSourceError::Protocol(format!("implausibly large KRB response: {} bytes", resp_len)));
+        return Err(TimeSourceError::Protocol(format!(
+            "implausibly large KRB response: {} bytes",
+            resp_len
+        )));
     }
     let mut resp = vec![0u8; resp_len];
     stream.read_exact(&mut resp).map_err(map_io_err)?;
@@ -69,7 +98,7 @@ fn fetch_kerberos(addr: SocketAddr, realm: &str, stealth_user: &str, timeout: Du
     let rtt = t_send.elapsed();
 
     // Single-point approximation: server time ≈ local midpoint of send/recv window.
-    let t_mid_us = system_time_to_us(t_send_sys) + (rtt.as_micros() as i64) / 2;
+    let t_mid_us = system_time_to_us(t_send_sys)? + (rtt.as_micros() as i64) / 2;
 
     let server_us = parse_krb_error(&resp)?;
     Ok(server_us - t_mid_us)
@@ -82,7 +111,8 @@ pub fn parse_krb_error(data: &[u8]) -> Result<i64, TimeSourceError> {
     let tag = next_byte(data, &mut pos, "KRB-ERROR tag")?;
     if tag != KRB_ERROR_TAG {
         return Err(TimeSourceError::Protocol(format!(
-            "expected KRB-ERROR tag 0x{:02X}, got 0x{:02X}", KRB_ERROR_TAG, tag
+            "expected KRB-ERROR tag 0x{:02X}, got 0x{:02X}",
+            KRB_ERROR_TAG, tag
         )));
     }
 
@@ -93,13 +123,18 @@ pub fn parse_krb_error(data: &[u8]) -> Result<i64, TimeSourceError> {
     let seq_tag = next_byte(data, &mut pos, "KRB-ERROR SEQUENCE tag")?;
     if seq_tag != SEQUENCE_TAG {
         return Err(TimeSourceError::Parse(format!(
-            "expected SEQUENCE tag 0x{:02X}, got 0x{:02X}", SEQUENCE_TAG, seq_tag
+            "expected SEQUENCE tag 0x{:02X}, got 0x{:02X}",
+            SEQUENCE_TAG, seq_tag
         )));
     }
     let seq_len = read_der_length(data, &mut pos)?;
-    let seq_end = pos + seq_len;
+    let seq_end = pos
+        .checked_add(seq_len)
+        .ok_or_else(|| TimeSourceError::Parse("SEQUENCE overflow".into()))?;
     if seq_end > data.len() {
-        return Err(TimeSourceError::Parse("KRB-ERROR SEQUENCE overruns buffer".into()));
+        return Err(TimeSourceError::Parse(
+            "KRB-ERROR SEQUENCE overruns buffer".into(),
+        ));
     }
 
     // Scan context-tagged fields until we find [4] (stime) and [5] (susec).
@@ -111,12 +146,15 @@ pub fn parse_krb_error(data: &[u8]) -> Result<i64, TimeSourceError> {
         let field_tag = next_byte(data, &mut pos, "field tag")?;
         let field_len = read_der_length(data, &mut pos)?;
 
-        if pos + field_len > data.len() {
+        let field_end = pos
+            .checked_add(field_len)
+            .ok_or_else(|| TimeSourceError::Parse("Field overflow".into()))?;
+        if field_end > data.len() {
             return Err(TimeSourceError::Parse("DER field overruns buffer".into()));
         }
 
-        let field_data = &data[pos..pos + field_len];
-        pos += field_len;
+        let field_data = &data[pos..field_end];
+        pos = field_end;
 
         match field_tag {
             STIME_TAG => {
@@ -129,10 +167,14 @@ pub fn parse_krb_error(data: &[u8]) -> Result<i64, TimeSourceError> {
         }
     }
 
-    let stime = stime_us.ok_or_else(|| TimeSourceError::Parse("KRB-ERROR missing stime [4]".into()))?;
+    // RFC 4120 §5.9.1 KRB-ERROR
+    // stime is in seconds, susec is microseconds.
+    let stime =
+        stime_us.ok_or_else(|| TimeSourceError::Parse("KRB-ERROR missing stime [4]".into()))?;
     let sus = susec.unwrap_or(0);
 
     // stime_us is Unix microseconds; susec is 0..999_999 additional offset within the second.
+    // OPSEC Rationale: We calculate single-point offset assuming stamping at receive time.
     Ok(stime + sus as i64)
 }
 
@@ -141,15 +183,24 @@ fn parse_context_generalizedtime(b: &[u8]) -> Result<i64, TimeSourceError> {
     let mut pos = 0;
     let tag = next_byte(b, &mut pos, "GeneralizedTime tag")?;
     if tag != GENERALIZED_TIME_TAG {
-        return Err(TimeSourceError::Parse(format!("expected GeneralizedTime 0x{:02X}, got 0x{:02X}", GENERALIZED_TIME_TAG, tag)));
+        return Err(TimeSourceError::Parse(format!(
+            "expected GeneralizedTime 0x{:02X}, got 0x{:02X}",
+            GENERALIZED_TIME_TAG, tag
+        )));
     }
     let len = read_der_length(b, &mut pos)?;
-    if pos + len > b.len() {
-        return Err(TimeSourceError::Parse("GeneralizedTime overruns buffer".into()));
+    let end_pos = pos
+        .checked_add(len)
+        .ok_or_else(|| TimeSourceError::Parse("GeneralizedTime overflow".into()))?;
+    if end_pos > b.len() {
+        return Err(TimeSourceError::Parse(
+            "GeneralizedTime overruns buffer".into(),
+        ));
     }
-    let s = std::str::from_utf8(&b[pos..pos + len])
+    let s = std::str::from_utf8(&b[pos..end_pos])
         .map_err(|_| TimeSourceError::Parse("GeneralizedTime not UTF-8".into()))?;
-    parse_generalized_time(s)
+    let st = parse_generalized_time(s)?;
+    system_time_to_us(st)
 }
 
 /// Parse a context-wrapped INTEGER into u32: [N] { 0x02 <len> <bytes> }
@@ -157,56 +208,29 @@ fn parse_context_integer_u32(b: &[u8]) -> Result<u32, TimeSourceError> {
     let mut pos = 0;
     let tag = next_byte(b, &mut pos, "INTEGER tag")?;
     if tag != INTEGER_TAG {
-        return Err(TimeSourceError::Parse(format!("expected INTEGER 0x{:02X}, got 0x{:02X}", INTEGER_TAG, tag)));
+        return Err(TimeSourceError::Parse(format!(
+            "expected INTEGER 0x{:02X}, got 0x{:02X}",
+            INTEGER_TAG, tag
+        )));
     }
     let len = read_der_length(b, &mut pos)?;
-    if pos + len > b.len() || len > 4 {
-        return Err(TimeSourceError::Parse(format!("INTEGER len {} out of range", len)));
+    let end_pos = pos
+        .checked_add(len)
+        .ok_or_else(|| TimeSourceError::Parse("INTEGER overflow".into()))?;
+    if end_pos > b.len() || len > 4 {
+        return Err(TimeSourceError::Parse(format!(
+            "INTEGER len {} out of range",
+            len
+        )));
     }
     let mut val = 0u32;
-    for &byte in &b[pos..pos + len] {
+    for &byte in &b[pos..end_pos] {
         val = (val << 8) | byte as u32;
     }
     Ok(val)
 }
 
-/// Parse KerberosTime (RFC 4120): "YYYYMMDDHHmmssZ" → Unix microseconds.
-fn parse_generalized_time(s: &str) -> Result<i64, TimeSourceError> {
-    // Expected format: "YYYYMMDDHHmmssZ" (15 chars + Z = 16, or sometimes without Z = 15).
-    let s = s.trim_end_matches('Z');
-    if s.len() < 14 {
-        return Err(TimeSourceError::Parse(format!("GeneralizedTime too short: {:?}", s)));
-    }
-    let year: i64 = parse_digits(&s[0..4])?;
-    let month: i64 = parse_digits(&s[4..6])?;
-    let day: i64 = parse_digits(&s[6..8])?;
-    let hour: i64 = parse_digits(&s[8..10])?;
-    let min: i64 = parse_digits(&s[10..12])?;
-    let sec: i64 = parse_digits(&s[12..14])?;
-
-    // Simple civil-to-Unix conversion (valid for years 1970..2100).
-    let days = civil_to_days(year, month, day)?;
-    let unix_secs = days * 86400 + hour * 3600 + min * 60 + sec;
-    Ok(unix_secs * 1_000_000)
-}
-
-fn parse_digits<T: std::str::FromStr>(s: &str) -> Result<T, TimeSourceError> {
-    s.parse().map_err(|_| TimeSourceError::Parse(format!("not digits: {:?}", s)))
-}
-
-/// Days since Unix epoch (1970-01-01) from civil date. Valid for 1970–2199.
-fn civil_to_days(y: i64, m: i64, d: i64) -> Result<i64, TimeSourceError> {
-    if y < 1970 || m < 1 || m > 12 || d < 1 || d > 31 {
-        return Err(TimeSourceError::Parse(format!("invalid date {}-{:02}-{:02}", y, m, d)));
-    }
-    // Algorithm from Howard Hinnant (public domain).
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Ok(era * 146097 + doe - 719468)
-}
+// Removed duplicated parse_generalized_time, parse_digits, civil_to_days
 
 /// Build a minimal AS-REQ DER for the given `cname` principal in `realm`.
 ///
@@ -216,14 +240,16 @@ fn civil_to_days(y: i64, m: i64, d: i64) -> Result<i64, TimeSourceError> {
 /// Event 4768 with FailureCode 0x6 (unknown principal), which is universal AD noise.
 pub fn build_as_req(realm: &str, cname: &str) -> Vec<u8> {
     let nonce: u32 = rand::thread_rng().gen();
-    let till = kerberos_time_far_future();
+    let till = kerberos_time_plausible_future();
 
     // Encode sub-structures.
     let pvno = der_integer(5);
     let msg_type = der_integer(10); // AS-REQ
 
-    let cname_enc = der_principal_name(0, &cname); // NT-UNKNOWN = 0
-    let sname_enc = der_principal_name(2, &format!("krbtgt/{}", realm)); // NT-SRV-INST = 2
+    // IOC Rationale: A single string "krbtgt/REALM" violates RFC 4120 §5.2.2 PrincipalName,
+    // which requires a sequence of strings. Elite EDRs catch badly encoded sname components.
+    let cname_enc = der_principal_name(0, &[cname]); // NT-UNKNOWN = 0
+    let sname_enc = der_principal_name(2, &["krbtgt", realm]); // NT-SRV-INST = 2
     let realm_enc = der_generalstring(realm);
     let till_enc = der_generalizedtime(&till);
     let nonce_enc = der_integer(nonce as u64);
@@ -243,20 +269,52 @@ pub fn build_as_req(realm: &str, cname: &str) -> Vec<u8> {
     let req_body = der_context(4, &der_sequence(&req_body_inner));
 
     // KDC-REQ SEQUENCE
-    let kdc_req_inner = [
-        der_context(1, &pvno),
-        der_context(2, &msg_type),
-        req_body,
-    ]
-    .concat();
+    let kdc_req_inner = [der_context(1, &pvno), der_context(2, &msg_type), req_body].concat();
     let kdc_req = der_sequence(&kdc_req_inner);
 
     // APPLICATION 10 wrapper (AS-REQ tag = 0x6A)
     der_application(10, &kdc_req)
 }
 
-fn kerberos_time_far_future() -> String {
-    "20380101000000Z".to_string()
+// We set 'till' to exactly 10 hours in the future (the default AD ticket lifetime)
+// with a slight ±30min jitter to avoid static exact periodicity.
+fn kerberos_time_plausible_future() -> String {
+    let mut rng = rand::thread_rng();
+    let offset_secs: i64 = 36000 + rng.gen_range(-1800..=1800); // 10h ± 30m
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs() as i64;
+    format_unix_as_kerberos_time((now + offset_secs) as u64)
+}
+
+fn format_unix_as_kerberos_time(unix_secs: u64) -> String {
+    let days = (unix_secs / 86400) as i64;
+    let secs_in_day = unix_secs % 86400;
+    let hour = secs_in_day / 3600;
+    let min = (secs_in_day % 3600) / 60;
+    let sec = secs_in_day % 60;
+
+    let (year, month, day) = days_to_civil(days);
+    format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}Z",
+        year, month, day, hour, min, sec
+    )
+}
+
+/// Inverse of civil_to_days (Howard Hinnant algorithm).
+fn days_to_civil(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 // --- Minimal DER encoding helpers ---
@@ -281,9 +339,15 @@ fn encode_der_length(buf: &mut Vec<u8>, len: usize) {
     }
 }
 
-fn der_sequence(inner: &[u8]) -> Vec<u8> { der_tlv(0x30, inner) }
-fn der_context(n: u8, inner: &[u8]) -> Vec<u8> { der_tlv(0xA0 | n, inner) }
-fn der_application(n: u8, inner: &[u8]) -> Vec<u8> { der_tlv(0x60 | n, inner) }
+fn der_sequence(inner: &[u8]) -> Vec<u8> {
+    der_tlv(0x30, inner)
+}
+fn der_context(n: u8, inner: &[u8]) -> Vec<u8> {
+    der_tlv(0xA0 | n, inner)
+}
+fn der_application(n: u8, inner: &[u8]) -> Vec<u8> {
+    der_tlv(0x60 | n, inner)
+}
 
 fn der_integer(v: u64) -> Vec<u8> {
     // Minimal unsigned DER integer; prepend 0x00 if high bit set.
@@ -297,25 +361,30 @@ fn der_integer(v: u64) -> Vec<u8> {
     der_tlv(0x02, &bytes)
 }
 
-fn der_generalstring(s: &str) -> Vec<u8> { der_tlv(0x1B, s.as_bytes()) }
-fn der_generalizedtime(s: &str) -> Vec<u8> { der_tlv(0x18, s.as_bytes()) }
+fn der_generalstring(s: &str) -> Vec<u8> {
+    der_tlv(0x1B, s.as_bytes())
+}
+fn der_generalizedtime(s: &str) -> Vec<u8> {
+    der_tlv(0x18, s.as_bytes())
+}
 
 fn der_bitstring_zero() -> Vec<u8> {
     // BIT STRING with 32 zero bits: 0x03 <len> <unused bits> <bytes...>
     der_tlv(0x03, &[0x00, 0x00, 0x00, 0x00, 0x00])
 }
 
-fn der_principal_name(name_type: u32, name: &str) -> Vec<u8> {
+fn der_principal_name(name_type: u32, names: &[&str]) -> Vec<u8> {
     let nt = der_context(0, &der_integer(name_type as u64));
-    let ns = der_context(1, &der_sequence(&der_generalstring(name)));
+    let mut ns_inner = Vec::new();
+    for &name in names {
+        ns_inner.extend_from_slice(&der_generalstring(name));
+    }
+    let ns = der_context(1, &der_sequence(&ns_inner));
     der_sequence(&[nt, ns].concat())
 }
 
 fn der_etype_sequence(etypes: &[i32]) -> Vec<u8> {
-    let inner: Vec<u8> = etypes
-        .iter()
-        .flat_map(|&e| der_integer(e as u64))
-        .collect();
+    let inner: Vec<u8> = etypes.iter().flat_map(|&e| der_integer(e as u64)).collect();
     der_sequence(&inner)
 }
 
@@ -337,7 +406,10 @@ fn read_der_length(data: &[u8], pos: &mut usize) -> Result<usize, TimeSourceErro
     }
     let n = (b & 0x7F) as usize;
     if n == 0 || n > 4 {
-        return Err(TimeSourceError::Parse(format!("unsupported DER length encoding: 0x{:02X}", b)));
+        return Err(TimeSourceError::Parse(format!(
+            "unsupported DER length encoding: 0x{:02X}",
+            b
+        )));
     }
     let mut len = 0usize;
     for _ in 0..n {
@@ -352,12 +424,6 @@ fn skip_der_length(data: &[u8], pos: &mut usize) -> Result<(), TimeSourceError> 
     Ok(())
 }
 
-fn system_time_to_us(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
-}
-
 fn map_io_err(e: std::io::Error) -> TimeSourceError {
     use std::io::ErrorKind::*;
     match e.kind() {
@@ -370,6 +436,7 @@ fn map_io_err(e: std::io::Error) -> TimeSourceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocols::common::civil_to_days;
 
     /// Real KRB-ERROR captured from Windows Server 2019 AD DC (anonymized).
     /// KRB_AP_ERR_PRINCIPAL_UNKNOWN for nonexistent principal.
@@ -406,7 +473,10 @@ mod tests {
     fn parse_krb_error_wrong_tag() {
         let mut pkt = sample_krb_error();
         pkt[0] = 0x30; // wrong tag
-        assert!(matches!(parse_krb_error(&pkt), Err(TimeSourceError::Protocol(_))));
+        assert!(matches!(
+            parse_krb_error(&pkt),
+            Err(TimeSourceError::Protocol(_))
+        ));
     }
 
     #[test]
@@ -446,7 +516,7 @@ mod tests {
     #[test]
     fn parse_generalized_time_known() {
         // 2024-01-15 10:30:00 UTC = Unix 1705314600
-        let us = parse_generalized_time("20240115103000Z").unwrap();
+        let us = system_time_to_us(parse_generalized_time("20240115103000Z").unwrap()).unwrap();
         assert_eq!(us, 1_705_314_600 * 1_000_000);
     }
 

@@ -21,7 +21,16 @@ pub enum TimeSourceError {
 
 pub trait TimeSource {
     fn name(&self) -> &'static str;
-    fn fetch(&self, target: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError>;
+    fn fetch(&self, target: SocketAddr, timeout: Duration)
+        -> Result<OffsetMicros, TimeSourceError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OrchestratorError {
+    #[error("all time sources failed. Last error: {0}")]
+    AllSourcesFailed(String),
+    #[error("no sources configured")]
+    NoSourcesConfigured,
 }
 
 pub struct Orchestrator {
@@ -39,7 +48,7 @@ impl Orchestrator {
         &self,
         target: SocketAddr,
         timeout: Duration,
-    ) -> anyhow::Result<(OffsetMicros, &'static str)> {
+    ) -> Result<(OffsetMicros, &'static str), OrchestratorError> {
         let mut last_err: Option<String> = None;
 
         for src in &self.sources {
@@ -51,20 +60,18 @@ impl Orchestrator {
                     return Ok((offset, src.name()));
                 }
                 Err(e) => {
-                    if !matches!(e, TimeSourceError::Config(_)) {
-                        if self.verbose || matches!(e, TimeSourceError::Protocol(_) | TimeSourceError::Parse(_)) {
-                            eprintln!("[{}] failed: {}", src.name(), e);
-                        }
-                        last_err = Some(format!("{}: {}", src.name(), e));
+                    if self.verbose || !matches!(e, TimeSourceError::Config(_)) {
+                        eprintln!("[{}] failed: {}", src.name(), e);
                     }
+                    last_err = Some(format!("{}: {}", src.name(), e));
                 }
             }
         }
-
-        anyhow::bail!(
-            "all time sources failed. Last error: {}",
-            last_err.unwrap_or_else(|| "no sources configured".into())
-        )
+        if let Some(err) = last_err {
+            Err(OrchestratorError::AllSourcesFailed(err))
+        } else {
+            Err(OrchestratorError::NoSourcesConfigured)
+        }
     }
 }
 

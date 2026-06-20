@@ -1,8 +1,12 @@
 /// SNTP client (RFC 4330) — fallback time source on UDP/123.
+///
+/// Protocol Specifications:
+/// - **RFC 5905 §7.3**: NTP Packet Header Format (updates RFC 4330)
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::time_src::{OffsetMicros, TimeSourceError, TimeSource};
+use super::common::system_time_to_us;
+use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct NtpSource;
 
@@ -14,15 +18,23 @@ impl TimeSource for NtpSource {
         "ntp"
     }
 
-    fn fetch(&self, target: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
+    fn fetch(
+        &self,
+        target: SocketAddr,
+        timeout: Duration,
+    ) -> Result<OffsetMicros, TimeSourceError> {
         let ntp_addr: SocketAddr = (target.ip(), 123).into();
         fetch_ntp(ntp_addr, timeout)
     }
 }
 
 fn fetch_ntp(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
-    let socket = UdpSocket::bind(if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" })
-        .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
+    let socket = UdpSocket::bind(if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
     socket
         .set_read_timeout(Some(timeout))
         .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
@@ -47,12 +59,18 @@ fn fetch_ntp(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
     let rtt = t_send.elapsed();
 
     if n < 48 {
-        return Err(TimeSourceError::Parse(format!("short NTP response: {} bytes", n)));
+        return Err(TimeSourceError::Parse(format!(
+            "short NTP response: {} bytes",
+            n
+        )));
     }
 
     let mode = buf[0] & 0x07;
     if mode != 4 && mode != 5 {
-        return Err(TimeSourceError::Protocol(format!("unexpected NTP mode: {}", mode)));
+        return Err(TimeSourceError::Protocol(format!(
+            "unexpected NTP mode: {}",
+            mode
+        )));
     }
 
     // t2 = receive timestamp (server received our packet), bytes 32..40
@@ -61,10 +79,10 @@ fn fetch_ntp(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
     let t3 = parse_ntp_timestamp(&buf[40..48])?;
 
     // t4 = local time at receive; approximate as t1 + RTT.
-    let t4_us = system_time_to_us(t1_sys) + rtt.as_micros() as i64;
+    let t4_us = system_time_to_us(t1_sys)? + rtt.as_micros() as i64;
 
     // RFC 4330 offset: ((t2 - t1) + (t3 - t4)) / 2
-    let t1_us = system_time_to_us(t1_sys);
+    let t1_us = system_time_to_us(t1_sys)?;
     let offset_us = ((t2 - t1_us) + (t3 - t4_us)) / 2;
 
     Ok(offset_us)
@@ -82,7 +100,10 @@ fn parse_ntp_timestamp(b: &[u8]) -> Result<i64, TimeSourceError> {
     let frac = u32::from_be_bytes([b[4], b[5], b[6], b[7]]);
 
     if secs < NTP_TO_UNIX {
-        return Err(TimeSourceError::Parse(format!("NTP seconds {} predates Unix epoch", secs)));
+        return Err(TimeSourceError::Parse(format!(
+            "NTP seconds {} predates Unix epoch",
+            secs
+        )));
     }
     let unix_secs = secs - NTP_TO_UNIX;
     // Integer-only: frac * 1_000_000 / 2^32 microseconds
@@ -98,13 +119,6 @@ fn system_time_to_ntp(t: SystemTime) -> (u32, u32) {
     // fraction: subsec_nanos * 2^32 / 1_000_000_000
     let frac = ((dur.subsec_nanos() as u64) << 32) / 1_000_000_000;
     (ntp_secs, frac as u32)
-}
-
-/// Convert SystemTime to microseconds since Unix epoch.
-fn system_time_to_us(t: SystemTime) -> i64 {
-    t.duration_since(UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
 }
 
 fn map_io_err(e: std::io::Error, op: &str) -> TimeSourceError {
@@ -153,8 +167,12 @@ mod tests {
         b[0..4].copy_from_slice(&secs.to_be_bytes());
         b[4..8].copy_from_slice(&frac.to_be_bytes());
         let us = parse_ntp_timestamp(&b).unwrap();
-        let expected = system_time_to_us(now);
+        let expected = system_time_to_us(now).unwrap();
         // Allow 1ms rounding error from integer division
-        assert!((us - expected).abs() < 1000, "roundtrip error: {}us", us - expected);
+        assert!(
+            (us - expected).abs() < 1000,
+            "roundtrip error: {}us",
+            us - expected
+        );
     }
 }
