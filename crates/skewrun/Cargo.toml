@@ -1,17 +1,18 @@
 [package]
 name = "skewrun"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Kerberos clock skew wrapper for faketime"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/joaov-botelho/skewrun"
+repository = "https://github.com/JVBotelho/skewrun"
+readme = "../../README.md"
 
 [[bin]]
 name = "skewrun"
 path = "src/main.rs"
 
 [dependencies]
-ad-time = { path = "../ad-time", version = "1.0.0" }
+ad-time = { path = "../ad-time", version = "1.0.1" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 which = "6"
