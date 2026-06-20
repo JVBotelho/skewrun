@@ -91,3 +91,12 @@ pub fn filetime_to_system_time(filetime: u64) -> Result<SystemTime, TimeSourceEr
     let nanos = ((unix_100ns % 10_000_000) * 100) as u32;
     Ok(UNIX_EPOCH + Duration::new(secs, nanos))
 }
+
+pub fn map_io_err(e: std::io::Error) -> TimeSourceError {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        TimedOut | WouldBlock => TimeSourceError::Timeout,
+        ConnectionRefused => TimeSourceError::Refused,
+        _ => TimeSourceError::Protocol(e.to_string()),
+    }
+}

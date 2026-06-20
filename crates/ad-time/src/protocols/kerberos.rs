@@ -19,7 +19,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
 
-use super::common::{parse_generalized_time, system_time_to_us};
+use super::ber::{
+    encode_application, encode_context, encode_generalizedtime, encode_generalstring,
+    encode_integer_u64, encode_sequence, encode_tlv,
+};
+use super::common::{map_io_err, parse_generalized_time, system_time_to_us};
 use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 // DER/ASN.1 tag constants used in KRB-ERROR parsing (RFC 4120 §5.9.1).
@@ -230,7 +234,6 @@ fn parse_context_integer_u32(b: &[u8]) -> Result<u32, TimeSourceError> {
     Ok(val)
 }
 
-// Removed duplicated parse_generalized_time, parse_digits, civil_to_days
 
 /// Build a minimal AS-REQ DER for the given `cname` principal in `realm`.
 ///
@@ -243,37 +246,37 @@ pub fn build_as_req(realm: &str, cname: &str) -> Vec<u8> {
     let till = kerberos_time_plausible_future();
 
     // Encode sub-structures.
-    let pvno = der_integer(5);
-    let msg_type = der_integer(10); // AS-REQ
+    let pvno = encode_integer_u64(5);
+    let msg_type = encode_integer_u64(10); // AS-REQ
 
     // IOC Rationale: A single string "krbtgt/REALM" violates RFC 4120 §5.2.2 PrincipalName,
     // which requires a sequence of strings. Elite EDRs catch badly encoded sname components.
     let cname_enc = der_principal_name(0, &[cname]); // NT-UNKNOWN = 0
     let sname_enc = der_principal_name(2, &["krbtgt", realm]); // NT-SRV-INST = 2
-    let realm_enc = der_generalstring(realm);
-    let till_enc = der_generalizedtime(&till);
-    let nonce_enc = der_integer(nonce as u64);
+    let realm_enc = encode_generalstring(realm);
+    let till_enc = encode_generalizedtime(&till);
+    let nonce_enc = encode_integer_u64(nonce as u64);
     let etype_enc = der_etype_sequence(&[17, 18, 23]); // aes128-cts, aes256-cts, rc4-hmac
 
     // req-body SEQUENCE (context tag [4])
     let req_body_inner = [
-        der_context(0, &der_bitstring_zero()), // kdc-options
-        der_context(1, &cname_enc),
-        der_context(2, &realm_enc),
-        der_context(3, &sname_enc),
-        der_context(5, &till_enc),
-        der_context(7, &nonce_enc),
-        der_context(8, &etype_enc),
+        encode_context(0, &der_bitstring_zero()), // kdc-options
+        encode_context(1, &cname_enc),
+        encode_context(2, &realm_enc),
+        encode_context(3, &sname_enc),
+        encode_context(5, &till_enc),
+        encode_context(7, &nonce_enc),
+        encode_context(8, &etype_enc),
     ]
     .concat();
-    let req_body = der_context(4, &der_sequence(&req_body_inner));
+    let req_body = encode_context(4, &encode_sequence(&req_body_inner));
 
     // KDC-REQ SEQUENCE
-    let kdc_req_inner = [der_context(1, &pvno), der_context(2, &msg_type), req_body].concat();
-    let kdc_req = der_sequence(&kdc_req_inner);
+    let kdc_req_inner = [encode_context(1, &pvno), encode_context(2, &msg_type), req_body].concat();
+    let kdc_req = encode_sequence(&kdc_req_inner);
 
     // APPLICATION 10 wrapper (AS-REQ tag = 0x6A)
-    der_application(10, &kdc_req)
+    encode_application(10, &kdc_req)
 }
 
 // We set 'till' to exactly 10 hours in the future (the default AD ticket lifetime)
@@ -317,75 +320,24 @@ fn days_to_civil(z: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-// --- Minimal DER encoding helpers ---
-
-fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    encode_der_length(&mut out, value.len());
-    out.extend_from_slice(value);
-    out
-}
-
-fn encode_der_length(buf: &mut Vec<u8>, len: usize) {
-    if len < 128 {
-        buf.push(len as u8);
-    } else if len < 256 {
-        buf.push(0x81);
-        buf.push(len as u8);
-    } else {
-        buf.push(0x82);
-        buf.push((len >> 8) as u8);
-        buf.push((len & 0xFF) as u8);
-    }
-}
-
-fn der_sequence(inner: &[u8]) -> Vec<u8> {
-    der_tlv(0x30, inner)
-}
-fn der_context(n: u8, inner: &[u8]) -> Vec<u8> {
-    der_tlv(0xA0 | n, inner)
-}
-fn der_application(n: u8, inner: &[u8]) -> Vec<u8> {
-    der_tlv(0x60 | n, inner)
-}
-
-fn der_integer(v: u64) -> Vec<u8> {
-    // Minimal unsigned DER integer; prepend 0x00 if high bit set.
-    let mut bytes = v.to_be_bytes().to_vec();
-    while bytes.len() > 1 && bytes[0] == 0 && (bytes[1] & 0x80) == 0 {
-        bytes.remove(0);
-    }
-    if bytes[0] & 0x80 != 0 {
-        bytes.insert(0, 0);
-    }
-    der_tlv(0x02, &bytes)
-}
-
-fn der_generalstring(s: &str) -> Vec<u8> {
-    der_tlv(0x1B, s.as_bytes())
-}
-fn der_generalizedtime(s: &str) -> Vec<u8> {
-    der_tlv(0x18, s.as_bytes())
-}
-
 fn der_bitstring_zero() -> Vec<u8> {
     // BIT STRING with 32 zero bits: 0x03 <len> <unused bits> <bytes...>
-    der_tlv(0x03, &[0x00, 0x00, 0x00, 0x00, 0x00])
+    encode_tlv(0x03, &[0x00, 0x00, 0x00, 0x00, 0x00])
 }
 
 fn der_principal_name(name_type: u32, names: &[&str]) -> Vec<u8> {
-    let nt = der_context(0, &der_integer(name_type as u64));
+    let nt = encode_context(0, &encode_integer_u64(name_type as u64));
     let mut ns_inner = Vec::new();
     for &name in names {
-        ns_inner.extend_from_slice(&der_generalstring(name));
+        ns_inner.extend_from_slice(&encode_generalstring(name));
     }
-    let ns = der_context(1, &der_sequence(&ns_inner));
-    der_sequence(&[nt, ns].concat())
+    let ns = encode_context(1, &encode_sequence(&ns_inner));
+    encode_sequence(&[nt, ns].concat())
 }
 
 fn der_etype_sequence(etypes: &[i32]) -> Vec<u8> {
-    let inner: Vec<u8> = etypes.iter().flat_map(|&e| der_integer(e as u64)).collect();
-    der_sequence(&inner)
+    let inner: Vec<u8> = etypes.iter().flat_map(|&e| encode_integer_u64(e as u64)).collect();
+    encode_sequence(&inner)
 }
 
 // --- DER decode helpers ---
@@ -424,14 +376,6 @@ fn skip_der_length(data: &[u8], pos: &mut usize) -> Result<(), TimeSourceError> 
     Ok(())
 }
 
-fn map_io_err(e: std::io::Error) -> TimeSourceError {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        TimedOut | WouldBlock => TimeSourceError::Timeout,
-        ConnectionRefused => TimeSourceError::Refused,
-        _ => TimeSourceError::Protocol(e.to_string()),
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -446,15 +390,15 @@ mod tests {
         let stime_str = "20240115103000Z";
         let susec_val: u32 = 123456;
 
-        let pvno = der_context(0, &der_integer(5));
-        let msg_type = der_context(1, &der_integer(30)); // KRB-ERROR
-        let stime_field = der_context(4, &der_generalizedtime(stime_str));
-        let susec_field = der_context(5, &der_integer(susec_val as u64));
-        let error_code = der_context(6, &der_integer(6)); // KRB_ERR_PRINCIPAL_UNKNOWN
+        let pvno = encode_context(0, &encode_integer_u64(5));
+        let msg_type = encode_context(1, &encode_integer_u64(30)); // KRB-ERROR
+        let stime_field = encode_context(4, &encode_generalizedtime(stime_str));
+        let susec_field = encode_context(5, &encode_integer_u64(susec_val as u64));
+        let error_code = encode_context(6, &encode_integer_u64(6)); // KRB_ERR_PRINCIPAL_UNKNOWN
 
         let inner = [pvno, msg_type, stime_field, susec_field, error_code].concat();
-        let seq = der_sequence(&inner);
-        der_tlv(0x7E, &seq)
+        let seq = encode_sequence(&inner);
+        encode_tlv(0x7E, &seq)
     }
 
     #[test]
@@ -501,15 +445,15 @@ mod tests {
     }
 
     #[test]
-    fn der_integer_zero() {
-        let enc = der_integer(0);
+    fn encode_integer_u64_zero() {
+        let enc = encode_integer_u64(0);
         assert_eq!(enc, vec![0x02, 0x01, 0x00]);
     }
 
     #[test]
-    fn der_integer_high_bit() {
+    fn encode_integer_u64_high_bit() {
         // 0xFF should encode as 0x02 0x02 0x00 0xFF (leading zero to keep positive)
-        let enc = der_integer(0xFF);
+        let enc = encode_integer_u64(0xFF);
         assert_eq!(enc, vec![0x02, 0x02, 0x00, 0xFF]);
     }
 
@@ -527,8 +471,8 @@ mod tests {
         let valid = sample_krb_error();
 
         // Forge a [4] tag with a different stime (year 2099-01-01 00:00:00Z = 4070908800)
-        let forged_stime = der_context(4, &der_generalizedtime("20990101000000Z"));
-        let forged_susec = der_context(5, &der_integer(999_999u64));
+        let forged_stime = encode_context(4, &encode_generalizedtime("20990101000000Z"));
+        let forged_susec = encode_context(5, &encode_integer_u64(999_999u64));
         let mut injected = valid.clone();
         injected.extend_from_slice(&forged_stime);
         injected.extend_from_slice(&forged_susec);

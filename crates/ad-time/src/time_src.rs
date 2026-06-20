@@ -60,7 +60,7 @@ impl Orchestrator {
                     return Ok((offset, src.name()));
                 }
                 Err(e) => {
-                    if self.verbose || !matches!(e, TimeSourceError::Config(_)) {
+                    if self.verbose && !matches!(e, TimeSourceError::Config(_)) {
                         eprintln!("[{}] failed: {}", src.name(), e);
                     }
                     last_err = Some(format!("{}: {}", src.name(), e));

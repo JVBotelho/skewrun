@@ -29,7 +29,7 @@ const STEALTH_USERS_POOL: &[&str] = &[
 #[command(
     name = "skewrun",
     about = "Query DC time via Kerberos/NTP/SMB and run a command under faketime with the correct offset",
-    after_help = "EXAMPLES:\n  skewrun 10.10.10.5 -r CORP.LOCAL -- impacket-getTGT CORP.LOCAL/user:pass\n  skewrun 10.10.10.5 --probe\n  skewrun 10.10.10.5 -r CORP.LOCAL -n"
+    after_help = "EXAMPLES:\n  skewrun 10.10.10.5 -r CORP.LOCAL -- impacket-getTGT CORP.LOCAL/user:pass\n  skewrun 10.10.10.5 --probe"
 )]
 struct Args {
     /// Target IP or hostname (DC)
@@ -90,7 +90,7 @@ fn main() -> anyhow::Result<()> {
     let timeout = Duration::from_secs(args.timeout);
 
     // Resolve target to SocketAddr (use port 0 as placeholder; each module overrides the port).
-    let target = format!("{}:0", args.target)
+    let target = (&args.target[..], 0)
         .to_socket_addrs()
         .with_context(|| format!("failed to resolve target '{}'", args.target))?
         .next()

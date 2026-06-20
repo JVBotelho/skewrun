@@ -21,7 +21,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use rand::Rng;
 
-use super::common::{parse_generalized_time, system_time_to_us};
+use super::ber::{encode_integer_i32, encode_tlv};
+use super::common::{map_io_err, parse_generalized_time, system_time_to_us};
 use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct CldapSource;
@@ -59,7 +60,12 @@ fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, Time
     socket.send_to(&req, addr).map_err(map_io_err)?;
 
     let mut buf = [0u8; 4096];
-    let (len, _src) = socket.recv_from(&mut buf).map_err(map_io_err)?;
+    let len = loop {
+        let (len, src) = socket.recv_from(&mut buf).map_err(map_io_err)?;
+        if src.ip() == addr.ip() {
+            break len;
+        }
+    };
 
     let rtt = t_send.elapsed();
     let resp = &buf[..len];
@@ -72,44 +78,6 @@ fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, Time
     Ok(server_us - t_mid_us)
 }
 
-// Basic BER/DER encoder helpers
-fn encode_tlv(tag: u8, val: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    let len = val.len();
-    if len < 128 {
-        out.push(len as u8);
-    } else if len <= 255 {
-        out.push(0x81);
-        out.push(len as u8);
-    } else {
-        out.push(0x82);
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-    }
-    out.extend_from_slice(val);
-    out
-}
-
-fn encode_int(val: i32) -> Vec<u8> {
-    let mut v = val;
-    let mut bytes = Vec::new();
-    if v == 0 {
-        bytes.push(0);
-    } else {
-        while v > 0 {
-            bytes.push((v & 0xff) as u8);
-            v >>= 8;
-        }
-        // If high bit is set, we need a 0x00 prefix to keep it positive in two's complement
-        if let Some(&last) = bytes.last() {
-            if last & 0x80 != 0 {
-                bytes.push(0x00);
-            }
-        }
-        bytes.reverse();
-    }
-    encode_tlv(0x02, &bytes)
-}
 
 fn build_cldap_search_request(msg_id: i32) -> Vec<u8> {
     // OPSEC: randomized timeLimit between 10..30s (looks like a normal client)
@@ -118,8 +86,8 @@ fn build_cldap_search_request(msg_id: i32) -> Vec<u8> {
     let base_object = encode_tlv(0x04, b""); // LDAPDN ""
     let scope = encode_tlv(0x0a, &[0]); // ENUMERATED 0 (baseObject)
     let deref = encode_tlv(0x0a, &[0]); // ENUMERATED 0 (neverDerefAliases)
-    let size_limit = encode_int(1); // INTEGER 1
-    let time_limit_enc = encode_int(time_limit);
+    let size_limit = encode_integer_i32(1); // INTEGER 1
+    let time_limit_enc = encode_integer_i32(time_limit);
     let types_only = encode_tlv(0x01, &[0x00]); // BOOLEAN FALSE
 
     // Filter: (objectClass=*)
@@ -153,7 +121,7 @@ fn build_cldap_search_request(msg_id: i32) -> Vec<u8> {
     let protocol_op = encode_tlv(0x63, &search_req_seq); // [APPLICATION 3] (searchRequest)
 
     let mut ldap_msg_seq = Vec::new();
-    ldap_msg_seq.extend_from_slice(&encode_int(msg_id));
+    ldap_msg_seq.extend_from_slice(&encode_integer_i32(msg_id));
     ldap_msg_seq.extend_from_slice(&protocol_op);
 
     encode_tlv(0x30, &ldap_msg_seq) // SEQUENCE (LDAPMessage)
@@ -317,14 +285,6 @@ fn parse_cldap_search_response(
     ))
 }
 
-fn map_io_err(e: std::io::Error) -> TimeSourceError {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        TimedOut | WouldBlock => TimeSourceError::Timeout,
-        ConnectionRefused => TimeSourceError::Refused,
-        _ => TimeSourceError::Protocol(e.to_string()),
-    }
-}
 
 #[cfg(test)]
 mod tests {

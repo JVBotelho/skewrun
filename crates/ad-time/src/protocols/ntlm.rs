@@ -21,13 +21,12 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime};
 
-use super::common::{filetime_to_system_time, system_time_to_us};
+use super::common::{filetime_to_system_time, map_io_err, system_time_to_us};
+use super::smb_common::build_negotiate_request;
 use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct NtlmSource;
 
-// SMB2 capabilities
-const SMB2_CAPABILITIES: u32 = 0x7F;
 
 impl TimeSource for NtlmSource {
     fn name(&self) -> &'static str {
@@ -89,48 +88,6 @@ fn fetch_ntlm(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeS
     Ok(server_us - t_mid_us)
 }
 
-fn build_negotiate_request() -> Vec<u8> {
-    let dialects: &[u16] = &[0x0300, 0x0210, 0x0202];
-    let dialect_count = dialects.len() as u16;
-
-    let body_size = 36 + (2 * dialect_count as usize);
-    let smb2_header_size = 64usize;
-    let total = smb2_header_size + body_size;
-
-    let mut pkt = vec![0u8; 4 + total];
-    pkt[1] = ((total >> 16) & 0xFF) as u8;
-    pkt[2] = ((total >> 8) & 0xFF) as u8;
-    pkt[3] = (total & 0xFF) as u8;
-
-    let h = &mut pkt[4..4 + smb2_header_size];
-    h[0..4].copy_from_slice(b"\xfeSMB");
-    h[4..6].copy_from_slice(&64u16.to_le_bytes());
-    h[12..14].copy_from_slice(&0u16.to_le_bytes()); // NEGOTIATE
-    h[18..20].copy_from_slice(&1u16.to_le_bytes()); // CreditRequest
-    h[28..36].copy_from_slice(&1u64.to_le_bytes()); // MessageId
-
-    let b = &mut pkt[4 + smb2_header_size..];
-    b[0..2].copy_from_slice(&36u16.to_le_bytes());
-    b[2..4].copy_from_slice(&dialect_count.to_le_bytes());
-    b[4..6].copy_from_slice(&1u16.to_le_bytes()); // SecurityMode=1
-    b[8..12].copy_from_slice(&SMB2_CAPABILITIES.to_le_bytes());
-
-    // OPSEC: Random ClientGuid (UUIDv4)
-    let mut guid = [0u8; 16];
-    for b_out in guid.iter_mut() {
-        *b_out = rand::random();
-    }
-    guid[6] = (guid[6] & 0x0F) | 0x40; // Version 4
-    guid[8] = (guid[8] & 0x3F) | 0x80; // Variant 10xx
-    b[12..28].copy_from_slice(&guid);
-
-    for (i, &d) in dialects.iter().enumerate() {
-        let off = 36 + i * 2;
-        b[off..off + 2].copy_from_slice(&d.to_le_bytes());
-    }
-
-    pkt
-}
 
 fn build_session_setup_type1() -> Vec<u8> {
     // Build NTLMSSP Type 1 (MS-NLMP §2.2.1.1)
@@ -328,14 +285,6 @@ fn read_smb_message(stream: &mut TcpStream) -> Result<Vec<u8>, TimeSourceError> 
     Ok(body)
 }
 
-fn map_io_err(e: std::io::Error) -> TimeSourceError {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        TimedOut | WouldBlock => TimeSourceError::Timeout,
-        ConnectionRefused => TimeSourceError::Refused,
-        _ => TimeSourceError::Protocol(e.to_string()),
-    }
-}
 
 #[cfg(test)]
 mod tests {
