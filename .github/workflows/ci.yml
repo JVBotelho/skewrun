@@ -40,7 +40,7 @@ jobs:
 
   build:
     name: Cross-compile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         target:
