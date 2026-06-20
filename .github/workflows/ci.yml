@@ -40,7 +40,7 @@ jobs:
 
   build:
     name: Cross-compile
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         target:
@@ -52,7 +52,24 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install cross
-        run: cargo install cross
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@cargo-zigbuild
       - name: Build
-        run: cross build --release --target ${{ matrix.target }} --workspace
+        run: cargo zigbuild --release --target ${{ matrix.target }} --workspace
+
+  fuzz:
+    name: Fuzz (short run)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - name: Fuzz parsers (60s each)
+        run: |
+          for target in fuzz_parse_krb_error fuzz_parse_cldap_response \
+                        fuzz_parse_ntlm_type2 fuzz_parse_negotiate_response \
+                        fuzz_parse_generalized_time; do
+            cargo +nightly fuzz run $target -- -max_total_time=60
+          done

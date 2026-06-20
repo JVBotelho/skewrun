@@ -21,13 +21,11 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime};
 
-use super::common::{filetime_to_system_time, system_time_to_us};
+use super::common::{filetime_to_system_time, map_io_err, system_time_to_us};
+use super::smb_common::build_negotiate_request;
 use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct NtlmSource;
-
-// SMB2 capabilities
-const SMB2_CAPABILITIES: u32 = 0x7F;
 
 impl TimeSource for NtlmSource {
     fn name(&self) -> &'static str {
@@ -45,7 +43,8 @@ impl TimeSource for NtlmSource {
 }
 
 fn fetch_ntlm(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(map_io_err)?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
@@ -89,64 +88,43 @@ fn fetch_ntlm(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeS
     Ok(server_us - t_mid_us)
 }
 
-fn build_negotiate_request() -> Vec<u8> {
-    let dialects: &[u16] = &[0x0300, 0x0210, 0x0202];
-    let dialect_count = dialects.len() as u16;
-
-    let body_size = 36 + (2 * dialect_count as usize);
-    let smb2_header_size = 64usize;
-    let total = smb2_header_size + body_size;
-
-    let mut pkt = vec![0u8; 4 + total];
-    pkt[1] = ((total >> 16) & 0xFF) as u8;
-    pkt[2] = ((total >> 8) & 0xFF) as u8;
-    pkt[3] = (total & 0xFF) as u8;
-
-    let h = &mut pkt[4..4 + smb2_header_size];
-    h[0..4].copy_from_slice(b"\xfeSMB");
-    h[4..6].copy_from_slice(&64u16.to_le_bytes());
-    h[12..14].copy_from_slice(&0u16.to_le_bytes()); // NEGOTIATE
-    h[18..20].copy_from_slice(&1u16.to_le_bytes()); // CreditRequest
-    h[28..36].copy_from_slice(&1u64.to_le_bytes()); // MessageId
-
-    let b = &mut pkt[4 + smb2_header_size..];
-    b[0..2].copy_from_slice(&36u16.to_le_bytes());
-    b[2..4].copy_from_slice(&dialect_count.to_le_bytes());
-    b[4..6].copy_from_slice(&1u16.to_le_bytes()); // SecurityMode=1
-    b[8..12].copy_from_slice(&SMB2_CAPABILITIES.to_le_bytes());
-
-    // OPSEC: Random ClientGuid (UUIDv4)
-    let mut guid = [0u8; 16];
-    for b_out in guid.iter_mut() {
-        *b_out = rand::random();
-    }
-    guid[6] = (guid[6] & 0x0F) | 0x40; // Version 4
-    guid[8] = (guid[8] & 0x3F) | 0x80; // Variant 10xx
-    b[12..28].copy_from_slice(&guid);
-
-    for (i, &d) in dialects.iter().enumerate() {
-        let off = 36 + i * 2;
-        b[off..off + 2].copy_from_slice(&d.to_le_bytes());
-    }
-
-    pkt
-}
-
 fn build_session_setup_type1() -> Vec<u8> {
     // Build NTLMSSP Type 1 (MS-NLMP §2.2.1.1)
     let mut ntlm = vec![];
     ntlm.extend_from_slice(b"NTLMSSP\0");
     ntlm.extend_from_slice(&1u32.to_le_bytes()); // MessageType = 1 (Negotiate)
 
-    // OPSEC Rationale: Generic minimal client flags. Real bitmask choice
-    // requires Phase 5 packet captures to match observed Windows traffic.
-    // Current set: NEGOTIATE_56 | NEGOTIATE_KEY_EXCH | NEGOTIATE_128 |
-    // NEGOTIATE_NTLM | REQUEST_TARGET | NEGOTIATE_UNICODE.
-    let flags: u32 = 0xE0000205;
+    // NTLM Type 1 negotiate flags. Per MS-NLMP §2.2.2.5, all bits in this value
+    // map to named flags; no MUST-BE-ZERO reserved bits are set:
+    //   0x80000000 NEGOTIATE_56 | 0x40000000 NEGOTIATE_KEY_EXCH
+    //   0x20000000 NEGOTIATE_128 | 0x02000000 NEGOTIATE_VERSION (requires Version field below)
+    //   0x00800000 NEGOTIATE_TARGET_INFO | 0x00080000 NEGOTIATE_EXTENDED_SESSIONSECURITY
+    //   0x00008000 NEGOTIATE_ALWAYS_SIGN | 0x00000200 NEGOTIATE_NTLM
+    //   0x00000020 NEGOTIATE_SEAL | 0x00000010 NEGOTIATE_SIGN
+    //   0x00000002 NEGOTIATE_OEM | 0x00000001 NEGOTIATE_UNICODE
+    // This combination is plausible for Windows 10/11 based on flag analysis.
+    // NOTE: the exact value sent by a real Windows client must be validated against
+    // a live pcap — the MS-NLMP spec does not document a per-version flag constant.
+    let flags: u32 = 0xE2888233;
     ntlm.extend_from_slice(&flags.to_le_bytes());
 
-    // DomainName/WorkstationName omitted (empty fields)
-    ntlm.extend_from_slice(&[0u8; 16]); // 8 bytes domain, 8 bytes workstation
+    // DomainNameFields: Len=0, MaxLen=0, BufferOffset=40 (size of fixed fields with Version)
+    ntlm.extend_from_slice(&0u16.to_le_bytes());
+    ntlm.extend_from_slice(&0u16.to_le_bytes());
+    ntlm.extend_from_slice(&40u32.to_le_bytes());
+
+    // WorkstationFields: Len=0, MaxLen=0, BufferOffset=40
+    ntlm.extend_from_slice(&0u16.to_le_bytes());
+    ntlm.extend_from_slice(&0u16.to_le_bytes());
+    ntlm.extend_from_slice(&40u32.to_le_bytes());
+
+    // Version (MS-NLMP §2.2.2.10):
+    //   Major=0x0A (10), Minor=0x00 — CONFIRMED for Windows 10/11 per MS-NLMP Appendix B §33.
+    //   Build=0x4A61 (19041, Win10 20H1) — a valid build; actual value varies per install.
+    //   Reserved=0x000000, NTLMRevisionCurrent=0x0F — CONFIRMED: NTLMSSP_REVISION_W2K3
+    //   is the sole defined value per MS-NLMP §2.2.2.10 and applies to all post-W2K3 Windows.
+    // NOTE: ProductBuild should be validated; use any realistic Win10/11 build (18362–26100).
+    ntlm.extend_from_slice(&[0x0A, 0x00, 0x61, 0x4A, 0x00, 0x00, 0x00, 0x0F]);
 
     let ntlm_len = ntlm.len();
 
@@ -172,7 +150,7 @@ fn build_session_setup_type1() -> Vec<u8> {
     b[0..2].copy_from_slice(&25u16.to_le_bytes()); // StructureSize = 25
     b[2] = 0; // Flags
     b[3] = 1; // SecurityMode
-    b[4..8].copy_from_slice(&0u32.to_le_bytes()); // Capabilities
+    b[4..8].copy_from_slice(&0x01u32.to_le_bytes()); // Capabilities: SMB2_GLOBAL_CAP_DFS only (MS-SMB2 §2.2.5; Windows always sends 0x01 in SESSION_SETUP)
     b[8..12].copy_from_slice(&0u32.to_le_bytes()); // Channel
     b[12..14].copy_from_slice(&88u16.to_le_bytes()); // SecurityBufferOffset = 64 + 24
     b[14..16].copy_from_slice(&(ntlm_len as u16).to_le_bytes()); // SecurityBufferLength
@@ -315,7 +293,9 @@ fn parse_ntlm_type2(ntlm: &[u8]) -> Result<SystemTime, TimeSourceError> {
 
 fn read_smb_message(stream: &mut TcpStream) -> Result<Vec<u8>, TimeSourceError> {
     let mut nb_header = [0u8; 4];
-    stream.read_exact(&mut nb_header).map_err(map_io_err)?;
+    stream
+        .read_exact(&mut nb_header)
+        .map_err(|e| map_io_err(e, "read_header"))?;
     let msg_len = u32::from_be_bytes(nb_header) & 0x00FF_FFFF;
     if msg_len > 65536 {
         return Err(TimeSourceError::Protocol(format!(
@@ -324,17 +304,10 @@ fn read_smb_message(stream: &mut TcpStream) -> Result<Vec<u8>, TimeSourceError> 
         )));
     }
     let mut body = vec![0u8; msg_len as usize];
-    stream.read_exact(&mut body).map_err(map_io_err)?;
+    stream
+        .read_exact(&mut body)
+        .map_err(|e| map_io_err(e, "read_body"))?;
     Ok(body)
-}
-
-fn map_io_err(e: std::io::Error) -> TimeSourceError {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        TimedOut | WouldBlock => TimeSourceError::Timeout,
-        ConnectionRefused => TimeSourceError::Refused,
-        _ => TimeSourceError::Protocol(e.to_string()),
-    }
 }
 
 #[cfg(test)]
@@ -384,4 +357,20 @@ mod tests {
         let unix_secs = st.duration_since(UNIX_EPOCH).unwrap().as_secs();
         assert_eq!(unix_secs, 1_704_067_200);
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_ntlm_type2_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let _ = parse_ntlm_type2(&data);
+        }
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_parse_ntlm_type2(
+    data: &[u8],
+) -> Result<std::time::SystemTime, crate::time_src::TimeSourceError> {
+    parse_ntlm_type2(data)
 }

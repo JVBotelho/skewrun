@@ -1,6 +1,6 @@
 # Skewrun
 
-[![CI](https://github.com/joaov-botelho/skewrun/actions/workflows/ci.yml/badge.svg)](https://github.com/joaov-botelho/skewrun/actions/workflows/ci.yml)
+[![CI](https://github.com/JVBotelho/skewrun/actions/workflows/ci.yml/badge.svg)](https://github.com/JVBotelho/skewrun/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/skewrun.svg)](https://crates.io/crates/skewrun)
 
 `skewrun` is an Active Directory time discovery toolkit for red teams. It dynamically resolves the Domain Controller's time via network protocols (CLDAP, SMB, NTP, Kerberos, NTLM) and executes commands via `libfaketime` (`LD_PRELOAD`), tricking the executed binary into using the exact DC time.
@@ -17,7 +17,7 @@ Starting with `v0.9.0`, Skewrun is built as a library-first architecture:
 
 ```bash
 # Pre-built static binary (no Rust toolchain required)
-wget https://github.com/joaov-botelho/skewrun/releases/latest/download/skewrun-x86_64-linux-musl
+wget https://github.com/JVBotelho/skewrun/releases/latest/download/skewrun-x86_64-linux-musl
 chmod +x skewrun-x86_64-linux-musl
 sudo mv skewrun-x86_64-linux-musl /usr/local/bin/skewrun
 
@@ -25,7 +25,7 @@ sudo mv skewrun-x86_64-linux-musl /usr/local/bin/skewrun
 cargo install skewrun
 
 # From source
-git clone https://github.com/joaov-botelho/skewrun && cd skewrun && cargo build --release
+git clone https://github.com/JVBotelho/skewrun && cd skewrun && cargo build --release
 ```
 
 *Note: You must have `libfaketime` installed on your system (e.g., `apt-get install libfaketime`).*
@@ -77,11 +77,25 @@ The goal is to blend in with standard Windows wire traffic and minimize forensic
 
 | Method | Protocol | Port | OPSEC Notes (EDR/NDR Visibility) |
 |--------|----------|------|-----------------------------------|
-| **cldap** (Default) | CLDAP | UDP/389 | **Extremely Stealthy**. Universally allowed. Emulates a standard Windows DC Locator Ping (`rootDSE`). Dilutes the attribute query and randomizes TimeLimits to evade NDRs. |
-| **smb** (Default) | SMB2 | TCP/445 | **Stealthy**. Extracts time from the `SMB2 NEGOTIATE` response. Plausible workstation noise. |
+| **cldap** (Default) | CLDAP | UDP/389 | **Extremely Stealthy**. Universally allowed. Sends a standard LDAP `rootDSE` diagnostic query (`objectClass=*` base search), matching the baseline of `ldapsearch`, PowerShell AD cmdlets, and monitoring tools. Dilutes the attribute list with common admin attrs and randomizes `timeLimit` to break static NDR signatures. |
+| **smb** (Default) | SMB2 | TCP/445 | **Stealthy**. Extracts time from the `SMB2 NEGOTIATE` response. Negotiates SMB 3.1.1 with `PREAUTH_INTEGRITY_CAPABILITIES` (SHA-512), matching Windows 10/11 client behavior. |
 | **ntp** (Default) | SNTP | UDP/123 | **Standard**. Native RFC 4330. Highly expected traffic from any client. |
 | **ntlm** | SMB2 | TCP/445 | **Stealthy**. Exploits `SMB2 SESSION_SETUP` to get an NTLM Type 2 Challenge containing `MsvAvTimestamp`. Disconnects TCP before Type 3, meaning **no Event ID 4625 (Logon Failure) is generated**. Emulates Windows 10/11 flags. |
-| **kerberos** | Kerberos | TCP/88 | **Loud**. Sends an `AS-REQ` for a non-existent user. Encodes proper two-component `sname`, rotates `cname` (typos like *admnistrator*), `till` (10h ± 30min jitter), `nonce`, and `ClientGuid` to blend in. Always generates Event 4768/0x6 (pre-authentication failure for unknown principal) which is exported to SIEM regardless of audit policy. May trigger honey-account alerts if the `cname` matches a configured tripwire. |
+| **kerberos** | Kerberos | TCP/88 | **Loud**. Sends an `AS-REQ` for a non-existent user. Encodes proper two-component `sname`, rotates `cname` (typos like *admnistrator*), sets `till` to the Windows hardcoded constant `20370913024805Z` (not local clock arithmetic — see ADR-0002), randomizes `nonce`. Always generates Event 4768/0x6 (pre-authentication failure for unknown principal) which is exported to SIEM regardless of audit policy. May trigger honey-account alerts if the `cname` matches a configured tripwire. |
+
+## Testing
+
+```bash
+cargo test                                            # unit + property tests
+cargo +nightly fuzz run fuzz_parse_krb_error          # Linux/macOS only
+```
+
+All network-facing parsers (`parse_krb_error`, `parse_cldap_search_response`, `parse_ntlm_type2`,
+`parse_negotiate_response`, `parse_ntp_timestamp`) are property-tested for panic safety using
+[proptest](https://github.com/proptest-rs/proptest) and fuzz-tested in CI.
+BER integer encoding is verified for DER minimality and sign correctness across the full `i32` range,
+covering negative etype values per RFC 4120.
+Fuzz targets and corpus live in `fuzz/`.
 
 ## License
 

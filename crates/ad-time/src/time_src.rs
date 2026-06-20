@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use rand::Rng;
+
 /// Signed offset in microseconds: server_time - local_time.
 /// Positive means the server is ahead of us.
 pub type OffsetMicros = i64;
@@ -51,7 +53,8 @@ impl Orchestrator {
     ) -> Result<(OffsetMicros, &'static str), OrchestratorError> {
         let mut last_err: Option<String> = None;
 
-        for src in &self.sources {
+        let n = self.sources.len();
+        for (i, src) in self.sources.iter().enumerate() {
             match src.fetch(target, timeout) {
                 Ok(offset) => {
                     if self.verbose {
@@ -60,10 +63,16 @@ impl Orchestrator {
                     return Ok((offset, src.name()));
                 }
                 Err(e) => {
+                    // Always show protocol failures (Timeout, Refused, Parse) so user knows why it failed.
+                    // Only suppress Config errors when not verbose.
                     if self.verbose || !matches!(e, TimeSourceError::Config(_)) {
                         eprintln!("[{}] failed: {}", src.name(), e);
                     }
                     last_err = Some(format!("{}: {}", src.name(), e));
+                    if i + 1 < n {
+                        let jitter_ms: u64 = rand::thread_rng().gen_range(500..=5_000);
+                        std::thread::sleep(Duration::from_millis(jitter_ms));
+                    }
                 }
             }
         }

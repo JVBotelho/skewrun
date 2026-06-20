@@ -1,0 +1,32 @@
+[package]
+name = "ad-time-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ad-time = { path = "../crates/ad-time", features = ["fuzzing"] }
+
+[[bin]]
+name = "fuzz_parse_krb_error"
+path = "fuzz_targets/fuzz_parse_krb_error.rs"
+
+[[bin]]
+name = "fuzz_parse_cldap_response"
+path = "fuzz_targets/fuzz_parse_cldap_response.rs"
+
+[[bin]]
+name = "fuzz_parse_ntlm_type2"
+path = "fuzz_targets/fuzz_parse_ntlm_type2.rs"
+
+[[bin]]
+name = "fuzz_parse_negotiate_response"
+path = "fuzz_targets/fuzz_parse_negotiate_response.rs"
+
+[[bin]]
+name = "fuzz_parse_generalized_time"
+path = "fuzz_targets/fuzz_parse_generalized_time.rs"

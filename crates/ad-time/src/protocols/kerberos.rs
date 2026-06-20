@@ -15,11 +15,15 @@
 /// triangulation). Sufficient for Kerberos' 5-minute skew window.
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use rand::Rng;
 
-use super::common::{parse_generalized_time, system_time_to_us};
+use super::ber::{
+    encode_application, encode_context, encode_generalizedtime, encode_generalstring,
+    encode_integer_i32, encode_integer_u64, encode_sequence, encode_tlv,
+};
+use super::common::{map_io_err, parse_generalized_time, system_time_to_us};
 use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 // DER/ASN.1 tag constants used in KRB-ERROR parsing (RFC 4120 §5.9.1).
@@ -60,7 +64,8 @@ fn fetch_kerberos(
     stealth_user: &str,
     timeout: Duration,
 ) -> Result<OffsetMicros, TimeSourceError> {
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(map_io_err)?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
@@ -83,7 +88,9 @@ fn fetch_kerberos(
 
     // Read response length prefix.
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(map_io_err)?;
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| map_io_err(e, "read_length"))?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
 
     if resp_len > 65536 {
@@ -93,7 +100,9 @@ fn fetch_kerberos(
         )));
     }
     let mut resp = vec![0u8; resp_len];
-    stream.read_exact(&mut resp).map_err(map_io_err)?;
+    stream
+        .read_exact(&mut resp)
+        .map_err(|e| map_io_err(e, "read_response"))?;
 
     let rtt = t_send.elapsed();
 
@@ -230,8 +239,6 @@ fn parse_context_integer_u32(b: &[u8]) -> Result<u32, TimeSourceError> {
     Ok(val)
 }
 
-// Removed duplicated parse_generalized_time, parse_digits, civil_to_days
-
 /// Build a minimal AS-REQ DER for the given `cname` principal in `realm`.
 ///
 /// `cname` should blend in with the environment (e.g. a plausible admin typo like
@@ -243,149 +250,110 @@ pub fn build_as_req(realm: &str, cname: &str) -> Vec<u8> {
     let till = kerberos_time_plausible_future();
 
     // Encode sub-structures.
-    let pvno = der_integer(5);
-    let msg_type = der_integer(10); // AS-REQ
+    let pvno = encode_integer_u64(5);
+    let msg_type = encode_integer_u64(10); // AS-REQ
 
     // IOC Rationale: A single string "krbtgt/REALM" violates RFC 4120 §5.2.2 PrincipalName,
     // which requires a sequence of strings. Elite EDRs catch badly encoded sname components.
-    let cname_enc = der_principal_name(0, &[cname]); // NT-UNKNOWN = 0
+    let cname_enc = der_principal_name(1, &[cname]); // NT-PRINCIPAL = 1
     let sname_enc = der_principal_name(2, &["krbtgt", realm]); // NT-SRV-INST = 2
-    let realm_enc = der_generalstring(realm);
-    let till_enc = der_generalizedtime(&till);
-    let nonce_enc = der_integer(nonce as u64);
-    let etype_enc = der_etype_sequence(&[17, 18, 23]); // aes128-cts, aes256-cts, rc4-hmac
+    let realm_enc = encode_generalstring(realm);
+    let till_enc = encode_generalizedtime(&till);
+    let nonce_enc = encode_integer_u64(nonce as u64);
+    // Windows 10/11/Server 2025 AS-REQ etype list (preference order per captured traffic).
+    // 18=aes256-cts-hmac-sha1-96, 17=aes128-cts-hmac-sha1-96, 23=rc4-hmac.
+    // Etypes 19/20 (RFC 8009: aes128-cts-hmac-sha256-128, aes256-cts-hmac-sha384-192) are
+    // defined in msDS-SupportedEncryptionTypes bits 0x40/0x80 for Windows Server 2025, but
+    // Microsoft's GPO docs list them under "Future encryption types — reserved by Microsoft
+    // for types that might be implemented." They are NOT yet active in etype negotiation as
+    // of mid-2026: Windows clients do not advertise 19/20 in AS-REQ on any current version.
+    // DES (3, 1) and rc4-exp (24) appear only on legacy Windows; disabled by default on
+    // modern AD (Server 2025 drops RC4 from KDC-issued TGTs entirely).
+    let etype_enc = der_etype_sequence(&[18, 17, 23]);
 
     // req-body SEQUENCE (context tag [4])
     let req_body_inner = [
-        der_context(0, &der_bitstring_zero()), // kdc-options
-        der_context(1, &cname_enc),
-        der_context(2, &realm_enc),
-        der_context(3, &sname_enc),
-        der_context(5, &till_enc),
-        der_context(7, &nonce_enc),
-        der_context(8, &etype_enc),
+        encode_context(0, &der_bitstring_kdc_options()), // kdc-options: forwardable + renewable
+        encode_context(1, &cname_enc),
+        encode_context(2, &realm_enc),
+        encode_context(3, &sname_enc),
+        encode_context(5, &till_enc),
+        encode_context(7, &nonce_enc),
+        encode_context(8, &etype_enc),
     ]
     .concat();
-    let req_body = der_context(4, &der_sequence(&req_body_inner));
+    let req_body = encode_context(4, &encode_sequence(&req_body_inner));
+
+    let padata = build_pa_pac_request_field();
 
     // KDC-REQ SEQUENCE
-    let kdc_req_inner = [der_context(1, &pvno), der_context(2, &msg_type), req_body].concat();
-    let kdc_req = der_sequence(&kdc_req_inner);
+    let kdc_req_inner = [
+        encode_context(1, &pvno),
+        encode_context(2, &msg_type),
+        padata,
+        req_body,
+    ]
+    .concat();
+    let kdc_req = encode_sequence(&kdc_req_inner);
 
     // APPLICATION 10 wrapper (AS-REQ tag = 0x6A)
-    der_application(10, &kdc_req)
+    encode_application(10, &kdc_req)
 }
 
-// We set 'till' to exactly 10 hours in the future (the default AD ticket lifetime)
-// with a slight ±30min jitter to avoid static exact periodicity.
 fn kerberos_time_plausible_future() -> String {
-    let mut rng = rand::thread_rng();
-    let offset_secs: i64 = 36000 + rng.gen_range(-1800..=1800); // 10h ± 30m
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs() as i64;
-    format_unix_as_kerberos_time((now + offset_secs) as u64)
+    // Windows 10 / Server 2019-2022 hardcode this far-future constant for `till`
+    // (INT32_MAX-adjacent; sourced from Windows 2003 kerberos implementation).
+    // The KDC ignores it and enforces local policy (typically 10h TGT lifetime).
+    // Computing `now + 10h` from the local clock is wrong: this tool is used precisely
+    // when the local clock is heavily desynchronized, so `till` would fall in the past
+    // and trigger KDC_ERR_NEVER_VALID instead of the expected KRB-ERROR with stime.
+    // Windows 11 22H2+ uses "99990913024805Z"; 2037 covers the broader client baseline.
+    "20370913024805Z".to_string()
 }
 
-fn format_unix_as_kerberos_time(unix_secs: u64) -> String {
-    let days = (unix_secs / 86400) as i64;
-    let secs_in_day = unix_secs % 86400;
-    let hour = secs_in_day / 3600;
-    let min = (secs_in_day % 3600) / 60;
-    let sec = secs_in_day % 60;
-
-    let (year, month, day) = days_to_civil(days);
-    format!(
-        "{:04}{:02}{:02}{:02}{:02}{:02}Z",
-        year, month, day, hour, min, sec
-    )
+fn der_bitstring_kdc_options() -> Vec<u8> {
+    // 0x40810010: forwardable (bit 1) | renewable (bit 8) | canonicalize (bit 15) |
+    // renewable-ok (bit 27) — observed in Windows Event ID 4768 logs and confirmed
+    // by multiple AD security references as the standard Windows AS-REQ kdc-options.
+    // RFC 4120 KerberosFlags BIT STRING: tag=0x03, unused=0x00, then 4 data bytes MSB-first.
+    encode_tlv(0x03, &[0x00, 0x40, 0x81, 0x00, 0x10])
 }
 
-/// Inverse of civil_to_days (Howard Hinnant algorithm).
-fn days_to_civil(z: i64) -> (i64, u32, u32) {
-    let z = z + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
-}
-
-// --- Minimal DER encoding helpers ---
-
-fn der_tlv(tag: u8, value: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    encode_der_length(&mut out, value.len());
-    out.extend_from_slice(value);
-    out
-}
-
-fn encode_der_length(buf: &mut Vec<u8>, len: usize) {
-    if len < 128 {
-        buf.push(len as u8);
-    } else if len < 256 {
-        buf.push(0x81);
-        buf.push(len as u8);
-    } else {
-        buf.push(0x82);
-        buf.push((len >> 8) as u8);
-        buf.push((len & 0xFF) as u8);
-    }
-}
-
-fn der_sequence(inner: &[u8]) -> Vec<u8> {
-    der_tlv(0x30, inner)
-}
-fn der_context(n: u8, inner: &[u8]) -> Vec<u8> {
-    der_tlv(0xA0 | n, inner)
-}
-fn der_application(n: u8, inner: &[u8]) -> Vec<u8> {
-    der_tlv(0x60 | n, inner)
-}
-
-fn der_integer(v: u64) -> Vec<u8> {
-    // Minimal unsigned DER integer; prepend 0x00 if high bit set.
-    let mut bytes = v.to_be_bytes().to_vec();
-    while bytes.len() > 1 && bytes[0] == 0 && (bytes[1] & 0x80) == 0 {
-        bytes.remove(0);
-    }
-    if bytes[0] & 0x80 != 0 {
-        bytes.insert(0, 0);
-    }
-    der_tlv(0x02, &bytes)
-}
-
-fn der_generalstring(s: &str) -> Vec<u8> {
-    der_tlv(0x1B, s.as_bytes())
-}
-fn der_generalizedtime(s: &str) -> Vec<u8> {
-    der_tlv(0x18, s.as_bytes())
-}
-
-fn der_bitstring_zero() -> Vec<u8> {
-    // BIT STRING with 32 zero bits: 0x03 <len> <unused bits> <bytes...>
-    der_tlv(0x03, &[0x00, 0x00, 0x00, 0x00, 0x00])
+fn build_pa_pac_request_field() -> Vec<u8> {
+    // PA-PAC-REQUEST (padata-type 128): Windows always sends this to request a PAC.
+    // Absence is a detectable anomaly (Zeek/DPI krb5 parser checks for it).
+    // KERB-PA-PAC-REQUEST ::= SEQUENCE { include-pac [0] BOOLEAN TRUE }
+    let include_pac = encode_context(0, &encode_tlv(0x01, &[0xff])); // BOOLEAN TRUE
+    let pac_req_val = encode_sequence(&include_pac);
+    // PA-DATA ::= SEQUENCE { padata-type [1] Int32, padata-value [2] OCTET STRING }
+    let pa_item = encode_sequence(
+        &[
+            encode_context(1, &encode_integer_u64(128)),
+            encode_context(2, &encode_tlv(0x04, &pac_req_val)),
+        ]
+        .concat(),
+    );
+    // padata [3] SEQUENCE OF PA-DATA  (RFC 4120 §5.4.1 KDC-REQ)
+    encode_context(3, &encode_sequence(&pa_item))
 }
 
 fn der_principal_name(name_type: u32, names: &[&str]) -> Vec<u8> {
-    let nt = der_context(0, &der_integer(name_type as u64));
+    let nt = encode_context(0, &encode_integer_u64(name_type as u64));
     let mut ns_inner = Vec::new();
     for &name in names {
-        ns_inner.extend_from_slice(&der_generalstring(name));
+        ns_inner.extend_from_slice(&encode_generalstring(name));
     }
-    let ns = der_context(1, &der_sequence(&ns_inner));
-    der_sequence(&[nt, ns].concat())
+    let ns = encode_context(1, &encode_sequence(&ns_inner));
+    encode_sequence(&[nt, ns].concat())
 }
 
 fn der_etype_sequence(etypes: &[i32]) -> Vec<u8> {
-    let inner: Vec<u8> = etypes.iter().flat_map(|&e| der_integer(e as u64)).collect();
-    der_sequence(&inner)
+    // RFC 4120 defines EncryptionType as Int32; negative values are reserved for
+    // private/experimental algorithms (RFC 3961 §8). encode_integer_i32 preserves
+    // the sign correctly; the former encode_integer_u64 cast would silently corrupt
+    // any negative etype passed by a downstream caller.
+    let inner: Vec<u8> = etypes.iter().flat_map(|&e| encode_integer_i32(e)).collect();
+    encode_sequence(&inner)
 }
 
 // --- DER decode helpers ---
@@ -424,15 +392,6 @@ fn skip_der_length(data: &[u8], pos: &mut usize) -> Result<(), TimeSourceError> 
     Ok(())
 }
 
-fn map_io_err(e: std::io::Error) -> TimeSourceError {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        TimedOut | WouldBlock => TimeSourceError::Timeout,
-        ConnectionRefused => TimeSourceError::Refused,
-        _ => TimeSourceError::Protocol(e.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,15 +405,15 @@ mod tests {
         let stime_str = "20240115103000Z";
         let susec_val: u32 = 123456;
 
-        let pvno = der_context(0, &der_integer(5));
-        let msg_type = der_context(1, &der_integer(30)); // KRB-ERROR
-        let stime_field = der_context(4, &der_generalizedtime(stime_str));
-        let susec_field = der_context(5, &der_integer(susec_val as u64));
-        let error_code = der_context(6, &der_integer(6)); // KRB_ERR_PRINCIPAL_UNKNOWN
+        let pvno = encode_context(0, &encode_integer_u64(5));
+        let msg_type = encode_context(1, &encode_integer_u64(30)); // KRB-ERROR
+        let stime_field = encode_context(4, &encode_generalizedtime(stime_str));
+        let susec_field = encode_context(5, &encode_integer_u64(susec_val as u64));
+        let error_code = encode_context(6, &encode_integer_u64(6)); // KRB_ERR_PRINCIPAL_UNKNOWN
 
         let inner = [pvno, msg_type, stime_field, susec_field, error_code].concat();
-        let seq = der_sequence(&inner);
-        der_tlv(0x7E, &seq)
+        let seq = encode_sequence(&inner);
+        encode_tlv(0x7E, &seq)
     }
 
     #[test]
@@ -501,15 +460,15 @@ mod tests {
     }
 
     #[test]
-    fn der_integer_zero() {
-        let enc = der_integer(0);
+    fn encode_integer_u64_zero() {
+        let enc = encode_integer_u64(0);
         assert_eq!(enc, vec![0x02, 0x01, 0x00]);
     }
 
     #[test]
-    fn der_integer_high_bit() {
+    fn encode_integer_u64_high_bit() {
         // 0xFF should encode as 0x02 0x02 0x00 0xFF (leading zero to keep positive)
-        let enc = der_integer(0xFF);
+        let enc = encode_integer_u64(0xFF);
         assert_eq!(enc, vec![0x02, 0x02, 0x00, 0xFF]);
     }
 
@@ -527,8 +486,8 @@ mod tests {
         let valid = sample_krb_error();
 
         // Forge a [4] tag with a different stime (year 2099-01-01 00:00:00Z = 4070908800)
-        let forged_stime = der_context(4, &der_generalizedtime("20990101000000Z"));
-        let forged_susec = der_context(5, &der_integer(999_999u64));
+        let forged_stime = encode_context(4, &encode_generalizedtime("20990101000000Z"));
+        let forged_susec = encode_context(5, &encode_integer_u64(999_999u64));
         let mut injected = valid.clone();
         injected.extend_from_slice(&forged_stime);
         injected.extend_from_slice(&forged_susec);
@@ -537,5 +496,14 @@ mod tests {
         let us = parse_krb_error(&injected).unwrap();
         let expected = 1_705_314_600i64 * 1_000_000 + 123_456;
         assert_eq!(us, expected, "post-sequence tag injection must be ignored");
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_krb_error_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let _ = parse_krb_error(&data);
+        }
     }
 }

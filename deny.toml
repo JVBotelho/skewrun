@@ -13,12 +13,7 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "ISC",
     "Unicode-3.0",
-    "Unicode-DFS-2016",
 ]
-deny = []
-copyleft = "deny"
-allow-osi-fsf-free = "neither"
-default = "deny"
 confidence-threshold = 0.8
 
 [bans]

@@ -1,13 +1,20 @@
 [package]
 name = "ad-time"
-version = "0.1.0"
+version = "1.1.0"
 edition = "2021"
 description = "Active Directory time discovery protocols for red teams."
-license = "MIT"
-repository = "https://github.com/joaov-botelho/skewrun"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/JVBotelho/skewrun"
+readme = "../../README.md"
 keywords = ["kerberos", "ntlm", "cldap", "active-directory", "pentest"]
 categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 thiserror = "1.0"
 rand = "0.8"
+
+[dev-dependencies]
+proptest = "1"
+
+[features]
+fuzzing = []

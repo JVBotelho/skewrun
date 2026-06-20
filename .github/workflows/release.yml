@@ -5,10 +5,13 @@ on:
     tags:
       - 'v*.*.*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build release binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     strategy:
       matrix:
         target:
@@ -23,11 +26,14 @@ jobs:
       with:
         targets: ${{ matrix.target }}
 
-    - name: Install cross
-      run: cargo install cross
+    - name: Install Zig
+      uses: mlugg/setup-zig@v2
 
-    - name: Build with cross
-      run: cross build --release --target ${{ matrix.target }} --package skewrun
+    - name: Install cargo-zigbuild
+      uses: taiki-e/install-action@cargo-zigbuild
+
+    - name: Build with cargo-zigbuild
+      run: cargo zigbuild --release --target ${{ matrix.target }} --package skewrun
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4

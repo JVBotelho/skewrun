@@ -11,17 +11,21 @@
 //! from the `rootDSE`.
 //!
 //! OPSEC:
-//! - UDP traffic to 389 is practically invisible to typical EDRs (it's standard DC discovery).
-//! - We dilute our attribute list with other standard rootDSE queries (`schemaNamingContext`,
-//!   `dnsHostName`, etc.) so it doesn't look like a surgical time probe.
-//! - `messageID` and `timeLimit` are randomized to break static signatures.
+//! - UDP/389 is practically invisible to typical EDRs and is rarely DPI'd or rate-limited.
+//! - The query pattern (rootDSE `objectClass=*` base search) matches the baseline of
+//!   `ldapsearch`, PowerShell AD cmdlets, and monitoring agents — not DC Locator Pings,
+//!   which use a different filter and attribute set.
+//! - The attribute list is diluted with common admin attrs so `currentTime` does not appear
+//!   as a surgical probe.
+//! - `messageID` and `timeLimit` are randomized to break static NDR signatures.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime};
 
 use rand::Rng;
 
-use super::common::{parse_generalized_time, system_time_to_us};
+use super::ber::{encode_integer_i32, encode_tlv};
+use super::common::{map_io_err, parse_generalized_time, system_time_to_us};
 use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct CldapSource;
@@ -42,11 +46,13 @@ impl TimeSource for CldapSource {
 }
 
 fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
-    let socket = UdpSocket::bind("0.0.0.0:0").map_err(map_io_err)?;
-    socket.set_read_timeout(Some(timeout)).map_err(map_io_err)?;
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| map_io_err(e, "bind"))?;
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| map_io_err(e, "set_read_timeout"))?;
     socket
         .set_write_timeout(Some(timeout))
-        .map_err(map_io_err)?;
+        .map_err(|e| map_io_err(e, "set_write_timeout"))?;
 
     // OPSEC: Randomize message ID (1..1000)
     let msg_id = rand::thread_rng().gen_range(1..=1000);
@@ -56,10 +62,31 @@ fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, Time
     let t_send = Instant::now();
     let t_send_sys = SystemTime::now();
 
-    socket.send_to(&req, addr).map_err(map_io_err)?;
+    socket
+        .send_to(&req, addr)
+        .map_err(|e| map_io_err(e, "send_to"))?;
 
+    // Enforce an overall deadline across the receive loop. Without it, an on-path
+    // attacker or a UDP flood with spoofed source IPs could keep the loop spinning
+    // indefinitely (each non-matching packet returns within the per-call timeout).
+    let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 4096];
-    let (len, _src) = socket.recv_from(&mut buf).map_err(map_io_err)?;
+    let len = loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or(TimeSourceError::Timeout)?;
+        socket
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| map_io_err(e, "set_read_timeout"))?;
+
+        let (len, src) = socket
+            .recv_from(&mut buf)
+            .map_err(|e| map_io_err(e, "recv_from"))?;
+        if src.ip() == addr.ip() {
+            break len;
+        }
+    };
 
     let rtt = t_send.elapsed();
     let resp = &buf[..len];
@@ -72,54 +99,16 @@ fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, Time
     Ok(server_us - t_mid_us)
 }
 
-// Basic BER/DER encoder helpers
-fn encode_tlv(tag: u8, val: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    let len = val.len();
-    if len < 128 {
-        out.push(len as u8);
-    } else if len <= 255 {
-        out.push(0x81);
-        out.push(len as u8);
-    } else {
-        out.push(0x82);
-        out.push((len >> 8) as u8);
-        out.push(len as u8);
-    }
-    out.extend_from_slice(val);
-    out
-}
-
-fn encode_int(val: i32) -> Vec<u8> {
-    let mut v = val;
-    let mut bytes = Vec::new();
-    if v == 0 {
-        bytes.push(0);
-    } else {
-        while v > 0 {
-            bytes.push((v & 0xff) as u8);
-            v >>= 8;
-        }
-        // If high bit is set, we need a 0x00 prefix to keep it positive in two's complement
-        if let Some(&last) = bytes.last() {
-            if last & 0x80 != 0 {
-                bytes.push(0x00);
-            }
-        }
-        bytes.reverse();
-    }
-    encode_tlv(0x02, &bytes)
-}
-
 fn build_cldap_search_request(msg_id: i32) -> Vec<u8> {
-    // OPSEC: randomized timeLimit between 10..30s (looks like a normal client)
-    let time_limit = rand::thread_rng().gen_range(10..=30);
+    // timeLimit = 0: no client-imposed limit. Standard per RFC 4511 §4.5.1 and
+    // the observed behavior of ldapsearch, PowerShell AD cmdlets, and monitoring tools.
+    // A randomized 10-30 range has no documented baseline and is self-generated noise.
+    let time_limit_enc = encode_integer_i32(0);
 
     let base_object = encode_tlv(0x04, b""); // LDAPDN ""
     let scope = encode_tlv(0x0a, &[0]); // ENUMERATED 0 (baseObject)
     let deref = encode_tlv(0x0a, &[0]); // ENUMERATED 0 (neverDerefAliases)
-    let size_limit = encode_int(1); // INTEGER 1
-    let time_limit_enc = encode_int(time_limit);
+    let size_limit = encode_integer_i32(1); // INTEGER 1
     let types_only = encode_tlv(0x01, &[0x00]); // BOOLEAN FALSE
 
     // Filter: (objectClass=*)
@@ -153,7 +142,7 @@ fn build_cldap_search_request(msg_id: i32) -> Vec<u8> {
     let protocol_op = encode_tlv(0x63, &search_req_seq); // [APPLICATION 3] (searchRequest)
 
     let mut ldap_msg_seq = Vec::new();
-    ldap_msg_seq.extend_from_slice(&encode_int(msg_id));
+    ldap_msg_seq.extend_from_slice(&encode_integer_i32(msg_id));
     ldap_msg_seq.extend_from_slice(&protocol_op);
 
     encode_tlv(0x30, &ldap_msg_seq) // SEQUENCE (LDAPMessage)
@@ -317,15 +306,6 @@ fn parse_cldap_search_response(
     ))
 }
 
-fn map_io_err(e: std::io::Error) -> TimeSourceError {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        TimedOut | WouldBlock => TimeSourceError::Timeout,
-        ConnectionRefused => TimeSourceError::Refused,
-        _ => TimeSourceError::Protocol(e.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,4 +329,23 @@ mod tests {
         // Should be a SEQUENCE
         assert_eq!(req[0], 0x30);
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_cldap_search_response_never_panics(
+            data in proptest::collection::vec(any::<u8>(), 0..512),
+        ) {
+            let _ = parse_cldap_search_response(&data, 1);
+        }
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_parse_cldap_response(
+    resp: &[u8],
+    msg_id: i32,
+) -> Result<std::time::SystemTime, crate::time_src::TimeSourceError> {
+    parse_cldap_search_response(resp, msg_id)
 }

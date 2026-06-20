@@ -5,7 +5,7 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use super::common::system_time_to_us;
+use super::common::{map_io_err, system_time_to_us};
 use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct NtpSource;
@@ -121,30 +121,21 @@ fn system_time_to_ntp(t: SystemTime) -> (u32, u32) {
     (ntp_secs, frac as u32)
 }
 
-fn map_io_err(e: std::io::Error, op: &str) -> TimeSourceError {
-    use std::io::ErrorKind::*;
-    match e.kind() {
-        TimedOut | WouldBlock => TimeSourceError::Timeout,
-        ConnectionRefused => TimeSourceError::Refused,
-        _ => TimeSourceError::Protocol(format!("{}: {}", op, e)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn parse_known_ntp_timestamp() {
-        // NTP seconds 3913958400 = 2024-01-01 00:00:00 UTC
-        // Unix = 3913958400 - 2208988800 = 1704969600
-        let secs: u32 = 3_913_958_400;
+        // NTP seconds 3913056000 = 2024-01-01 00:00:00 UTC
+        // Unix = 3913056000 - 2208988800 = 1704067200
+        let secs: u32 = 3_913_056_000;
         let frac: u32 = 0;
         let mut b = [0u8; 8];
         b[0..4].copy_from_slice(&secs.to_be_bytes());
         b[4..8].copy_from_slice(&frac.to_be_bytes());
         let us = parse_ntp_timestamp(&b).unwrap();
-        assert_eq!(us, 1_704_969_600 * 1_000_000);
+        assert_eq!(us, 1_704_067_200 * 1_000_000);
     }
 
     #[test]
@@ -174,5 +165,14 @@ mod tests {
             "roundtrip error: {}us",
             us - expected
         );
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_ntp_timestamp_never_panics(data in proptest::collection::vec(any::<u8>(), 0..16)) {
+            let _ = parse_ntp_timestamp(&data);
+        }
     }
 }

@@ -42,6 +42,13 @@ pub fn parse_generalized_time(s: &str) -> Result<SystemTime, TimeSourceError> {
         .parse()
         .map_err(|_| TimeSourceError::Parse("invalid sec".into()))?;
 
+    if !(0..24).contains(&hour) || !(0..60).contains(&min) || !(0..60).contains(&sec) {
+        return Err(TimeSourceError::Parse(format!(
+            "GeneralizedTime time-of-day out of range: {:02}:{:02}:{:02}",
+            hour, min, sec
+        )));
+    }
+
     let days = civil_to_days(year, month, day)?;
     let unix_secs = days * 86400 + hour * 3600 + min * 60 + sec;
 
@@ -90,4 +97,64 @@ pub fn filetime_to_system_time(filetime: u64) -> Result<SystemTime, TimeSourceEr
     let secs = unix_100ns / 10_000_000;
     let nanos = ((unix_100ns % 10_000_000) * 100) as u32;
     Ok(UNIX_EPOCH + Duration::new(secs, nanos))
+}
+
+pub fn map_io_err(e: std::io::Error, op: &str) -> TimeSourceError {
+    use std::io::ErrorKind::*;
+    match e.kind() {
+        TimedOut | WouldBlock => TimeSourceError::Timeout,
+        ConnectionRefused => TimeSourceError::Refused,
+        _ => TimeSourceError::Protocol(format!("{}: {}", op, e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_generalized_time_never_panics(s in ".*") {
+            // Must not panic on any string input. Err is fine.
+            let _ = parse_generalized_time(&s);
+        }
+
+        #[test]
+        fn parse_generalized_time_valid_range_accepted(
+            year in 1970u32..2100,
+            month in 1u32..=12,
+            day in 1u32..=28,   // 28 safe across all months
+            hour in 0u32..=23,
+            min in 0u32..=59,
+            sec in 0u32..=59,
+        ) {
+            let s = format!("{:04}{:02}{:02}{:02}{:02}{:02}Z", year, month, day, hour, min, sec);
+            prop_assert!(parse_generalized_time(&s).is_ok(), "valid date rejected: {}", s);
+        }
+
+        #[test]
+        fn parse_generalized_time_out_of_range_rejected(
+            hour in 24u32..=99,
+        ) {
+            let s = format!("20240115{:02}0000Z", hour);
+            prop_assert!(parse_generalized_time(&s).is_err());
+        }
+
+        #[test]
+        fn civil_to_days_monotone(
+            y in 1970i64..2100,
+            m in 1i64..=11,  // m+1 always valid
+            d in 1i64..=27,  // d+1 always valid
+        ) {
+            let d1 = civil_to_days(y, m, d).unwrap();
+            let d2 = civil_to_days(y, m, d + 1).unwrap();
+            prop_assert!(d1 < d2, "day+1 must produce larger day count");
+        }
+
+        #[test]
+        fn civil_to_days_pre_epoch_rejected(y in 1900i64..=1969) {
+            prop_assert!(civil_to_days(y, 6, 15).is_err());
+        }
+    }
 }
