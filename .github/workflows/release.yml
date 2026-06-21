@@ -60,7 +60,7 @@ jobs:
         mv artifacts/skewrun-aarch64-unknown-linux-musl/skewrun release_assets/skewrun-aarch64-linux-musl
 
     - name: Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         files: release_assets/*
       env:
