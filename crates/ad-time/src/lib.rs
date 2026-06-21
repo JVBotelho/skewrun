@@ -1,3 +1,5 @@
+#![deny(unsafe_code)]
+
 pub mod protocols;
 pub mod time_src;
 

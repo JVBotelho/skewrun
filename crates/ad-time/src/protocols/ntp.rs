@@ -49,13 +49,13 @@ fn fetch_ntp(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
     req[40..44].copy_from_slice(&t1_ntp.0.to_be_bytes());
     req[44..48].copy_from_slice(&t1_ntp.1.to_be_bytes());
 
-    socket.connect(addr).map_err(map_io_err)?;
+    socket.connect(addr).map_err(|e| map_io_err(e, "connect"))?;
 
     let t_send = Instant::now();
-    socket.send(&req).map_err(map_io_err)?;
+    socket.send(&req).map_err(|e| map_io_err(e, "send"))?;
 
     let mut buf = [0u8; 48];
-    let n = socket.recv(&mut buf).map_err(map_io_err)?;
+    let n = socket.recv(&mut buf).map_err(|e| map_io_err(e, "recv"))?;
     let rtt = t_send.elapsed();
 
     if n < 48 {
@@ -122,6 +122,7 @@ fn system_time_to_ntp(t: SystemTime) -> (u32, u32) {
 }
 
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,5 +167,14 @@ mod tests {
             "roundtrip error: {}us",
             us - expected
         );
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_ntp_timestamp_never_panics(data in proptest::collection::vec(any::<u8>(), 0..16)) {
+            let _ = parse_ntp_timestamp(&data);
+        }
     }
 }

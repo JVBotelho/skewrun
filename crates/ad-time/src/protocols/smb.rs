@@ -79,7 +79,7 @@ impl TimeSource for SmbSource {
 }
 
 fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(map_io_err)?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
@@ -97,7 +97,7 @@ fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
 
     // Read NetBIOS header (4 bytes) to know response length.
     let mut nb_header = [0u8; 4];
-    stream.read_exact(&mut nb_header).map_err(map_io_err)?;
+    stream.read_exact(&mut nb_header).map_err(|e| map_io_err(e, "read_header"))?;
     // NetBIOS session message: byte 0 = 0x00, bytes 1..4 = 24-bit big-endian length.
     let msg_len = u32::from_be_bytes(nb_header) & 0x00FF_FFFF;
     if msg_len > 65536 {
@@ -114,7 +114,7 @@ fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
     }
 
     let mut body = vec![0u8; msg_len as usize];
-    stream.read_exact(&mut body).map_err(map_io_err)?;
+    stream.read_exact(&mut body).map_err(|e| map_io_err(e, "read_body"))?;
 
     let rtt = t_send.elapsed();
 
@@ -136,6 +136,12 @@ fn parse_negotiate_response(b: &[u8]) -> Result<SystemTime, TimeSourceError> {
     let mut r = FieldReader::new(b);
     // Fields are little-endian; read sequentially per MS-SMB2 §2.2.4.
     let structure_size = r.read_u16_le()?; //  0: StructureSize (must be 65)
+    if structure_size != 65 {
+        return Err(TimeSourceError::Protocol(format!(
+            "unexpected SMB2 NEGOTIATE_RESPONSE StructureSize: {}",
+            structure_size
+        )));
+    }
     let _security_mode = r.read_u16_le()?; //  2: SecurityMode
     let _dialect_revision = r.read_u16_le()?; //  4: DialectRevision
     let _negotiate_ctx_cnt = r.read_u16_le()?; //  6: NegotiateContextCount/Reserved
@@ -145,13 +151,6 @@ fn parse_negotiate_response(b: &[u8]) -> Result<SystemTime, TimeSourceError> {
     let _max_read = r.read_u32_le()?; // 32: MaxReadSize
     let _max_write = r.read_u32_le()?; // 36: MaxWriteSize
     let system_time = r.read_u64_le()?; // 40: SystemTime (FILETIME)
-
-    if structure_size != 65 {
-        return Err(TimeSourceError::Protocol(format!(
-            "unexpected SMB2 NEGOTIATE_RESPONSE StructureSize: {}",
-            structure_size
-        )));
-    }
 
     filetime_to_system_time(system_time)
 }
@@ -216,6 +215,27 @@ mod tests {
     }
 
     #[test]
+    fn build_negotiate_request_advertises_smb311() {
+        use crate::protocols::smb_common::build_negotiate_request;
+        let req = build_negotiate_request();
+        // Packet layout: NetBIOS(4) + SMB2 header(64) + body fixed(36) = dialects start at pkt[104]
+        assert_eq!(
+            u16::from_le_bytes([req[104], req[105]]),
+            0x0311,
+            "first dialect must be SMB 3.1.1"
+        );
+        // NegotiateContextOffset at body offset 28 → pkt[4 + 64 + 28] = pkt[96]
+        let neg_ctx_off = u32::from_le_bytes([req[96], req[97], req[98], req[99]]);
+        assert_eq!(neg_ctx_off, 112, "NegotiateContextOffset must be 112 (8-byte aligned from SMB2 header start)");
+        // PREAUTH_INTEGRITY_CAPABILITIES context type at pkt[4 + 112] = pkt[116]
+        assert_eq!(
+            u16::from_le_bytes([req[116], req[117]]),
+            0x0001,
+            "negotiate context must be PREAUTH_INTEGRITY_CAPABILITIES"
+        );
+    }
+
+    #[test]
     fn fetch_smb_rejects_large_msg_len() {
         // Simulate a NetBIOS header claiming a 128 KB response body (> 65536 limit).
         // We cannot call fetch_smb (needs a real socket), but we can verify the
@@ -228,4 +248,20 @@ mod tests {
         assert_eq!(msg_len, 131072);
         assert!(msg_len > 65536);
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_negotiate_response_never_panics(data in proptest::collection::vec(any::<u8>(), 0..256)) {
+            let _ = parse_negotiate_response(&data);
+        }
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_parse_negotiate_response(data: &[u8]) 
+    -> Result<std::time::SystemTime, crate::time_src::TimeSourceError> 
+{
+    parse_negotiate_response(data)
 }

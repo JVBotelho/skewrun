@@ -58,3 +58,19 @@ jobs:
         uses: taiki-e/install-action@cargo-zigbuild
       - name: Build
         run: cargo zigbuild --release --target ${{ matrix.target }} --workspace
+
+  fuzz:
+    name: Fuzz (short run)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - name: Fuzz parsers (60s each)
+        run: |
+          for target in fuzz_parse_krb_error fuzz_parse_cldap_response \
+                        fuzz_parse_ntlm_type2 fuzz_parse_negotiate_response \
+                        fuzz_parse_generalized_time; do
+            cargo +nightly fuzz run $target -- -max_total_time=60
+          done
+        working-directory: fuzz

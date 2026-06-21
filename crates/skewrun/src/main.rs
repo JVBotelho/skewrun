@@ -16,6 +16,7 @@ use ad_time::protocols::ntp::NtpSource;
 use ad_time::protocols::smb::SmbSource;
 use ad_time::time_src::{format_offset, Orchestrator, TimeSource};
 use rand::seq::SliceRandom;
+use rand::Rng;
 
 const STEALTH_USERS_POOL: &[&str] = &[
     "admnistrator",
@@ -147,7 +148,13 @@ fn run_probe(
     let sources = build_sources(method_csv, realm, stealth_user);
     let mut any_success = false;
 
+    let mut first = true;
     for src in &sources {
+        if !first {
+            let jitter_ms: u64 = rand::thread_rng().gen_range(500..=5_000);
+            std::thread::sleep(Duration::from_millis(jitter_ms));
+        }
+        first = false;
         match src.fetch(target, timeout) {
             Ok(offset_us) => {
                 println!("{:<10} {}", src.name(), format_offset(offset_us));
@@ -196,10 +203,11 @@ fn read_realm_from_krb5_conf() -> Option<String> {
     let path = std::env::var("KRB5_CONFIG")
         .ok()
         .unwrap_or_else(|| "/etc/krb5.conf".to_string());
+    read_realm_from_file(&path)
+}
 
-    let content = std::fs::read_to_string(&path).ok()?;
-
-    // Look for `default_realm = REALM` under [libdefaults].
+fn read_realm_from_file(path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
     let mut in_libdefaults = false;
     for line in content.lines() {
         let trimmed = line.trim();
@@ -244,7 +252,9 @@ fn resolve_faketime_bin(explicit: Option<&str>) -> String {
 }
 
 fn run_under_faketime(offset_fmt: &str, command: &[String], bin: &str) -> anyhow::Result<()> {
-    let cmd_bin = &command[0];
+    let cmd_bin = command
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("command is empty"))?;
     let cmd_args = &command[1..];
 
     // OPSEC / UX: Warn if the target binary is statically linked.
@@ -277,4 +287,97 @@ fn run_under_faketime(offset_fmt: &str, command: &[String], bin: &str) -> anyhow
     let code = status.code().unwrap_or(1);
 
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- build_sources ---
+
+    #[test]
+    fn build_sources_default_order() {
+        let sources = build_sources("cldap,smb,ntp", None, "test");
+        let names: Vec<_> = sources.iter().map(|s| s.name()).collect();
+        assert_eq!(names, ["cldap", "smb", "ntp"]);
+    }
+
+    #[test]
+    fn build_sources_unknown_method_skipped() {
+        let sources = build_sources("cldap,bogus,smb", None, "test");
+        let names: Vec<_> = sources.iter().map(|s| s.name()).collect();
+        assert_eq!(names, ["cldap", "smb"]);
+    }
+
+    #[test]
+    fn build_sources_all_known_methods() {
+        let sources = build_sources("kerberos,cldap,ntlm,ntp,smb", Some("CORP.LOCAL"), "test");
+        assert_eq!(sources.len(), 5);
+    }
+
+    #[test]
+    fn build_sources_empty_csv_yields_no_sources() {
+        let sources = build_sources("", None, "test");
+        assert_eq!(sources.len(), 0);
+    }
+
+    // --- run_under_faketime: F10 regression guard ---
+
+    #[test]
+    fn run_under_faketime_empty_command_errors() {
+        let result = run_under_faketime("+0s", &[], "faketime");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("command is empty"));
+    }
+
+    // --- resolve_faketime_bin: explicit passthrough ---
+
+    #[test]
+    fn resolve_faketime_bin_explicit_returned_verbatim() {
+        assert_eq!(resolve_faketime_bin(Some("/custom/faketime")), "/custom/faketime");
+    }
+
+    // --- read_realm_from_file ---
+
+    struct TempKrb5(std::path::PathBuf);
+    impl TempKrb5 {
+        fn new(content: &str) -> Self {
+            static CTR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = CTR.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let path = std::env::temp_dir().join(format!("skewrun_krb5_{}.conf", n));
+            std::fs::write(&path, content).unwrap();
+            TempKrb5(path)
+        }
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+    impl Drop for TempKrb5 {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn read_realm_from_file_valid() {
+        let f = TempKrb5::new("[libdefaults]\n    default_realm = CORP.LOCAL\n");
+        assert_eq!(read_realm_from_file(f.path()), Some("CORP.LOCAL".to_string()));
+    }
+
+    #[test]
+    fn read_realm_from_file_no_libdefaults_section() {
+        let f = TempKrb5::new("[realms]\n    CORP.LOCAL = {}\n");
+        assert_eq!(read_realm_from_file(f.path()), None);
+    }
+
+    #[test]
+    fn read_realm_from_file_missing_returns_none() {
+        assert_eq!(read_realm_from_file("/nonexistent/skewrun/path.conf"), None);
+    }
+
+    #[test]
+    fn read_realm_from_file_empty_realm_value_ignored() {
+        let f = TempKrb5::new("[libdefaults]\n    default_realm =\n");
+        assert_eq!(read_realm_from_file(f.path()), None);
+    }
 }
