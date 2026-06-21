@@ -334,7 +334,10 @@ mod tests {
 
     #[test]
     fn resolve_faketime_bin_explicit_returned_verbatim() {
-        assert_eq!(resolve_faketime_bin(Some("/custom/faketime")), "/custom/faketime");
+        assert_eq!(
+            resolve_faketime_bin(Some("/custom/faketime")),
+            "/custom/faketime"
+        );
     }
 
     // --- read_realm_from_file ---
@@ -361,7 +364,10 @@ mod tests {
     #[test]
     fn read_realm_from_file_valid() {
         let f = TempKrb5::new("[libdefaults]\n    default_realm = CORP.LOCAL\n");
-        assert_eq!(read_realm_from_file(f.path()), Some("CORP.LOCAL".to_string()));
+        assert_eq!(
+            read_realm_from_file(f.path()),
+            Some("CORP.LOCAL".to_string())
+        );
     }
 
     #[test]

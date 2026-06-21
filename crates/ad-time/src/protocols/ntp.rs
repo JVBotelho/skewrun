@@ -121,8 +121,6 @@ fn system_time_to_ntp(t: SystemTime) -> (u32, u32) {
     (ntp_secs, frac as u32)
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

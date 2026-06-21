@@ -64,7 +64,8 @@ fn fetch_kerberos(
     stealth_user: &str,
     timeout: Duration,
 ) -> Result<OffsetMicros, TimeSourceError> {
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
@@ -87,7 +88,9 @@ fn fetch_kerberos(
 
     // Read response length prefix.
     let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(|e| map_io_err(e, "read_length"))?;
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| map_io_err(e, "read_length"))?;
     let resp_len = u32::from_be_bytes(len_buf) as usize;
 
     if resp_len > 65536 {
@@ -97,7 +100,9 @@ fn fetch_kerberos(
         )));
     }
     let mut resp = vec![0u8; resp_len];
-    stream.read_exact(&mut resp).map_err(|e| map_io_err(e, "read_response"))?;
+    stream
+        .read_exact(&mut resp)
+        .map_err(|e| map_io_err(e, "read_response"))?;
 
     let rtt = t_send.elapsed();
 
@@ -234,7 +239,6 @@ fn parse_context_integer_u32(b: &[u8]) -> Result<u32, TimeSourceError> {
     Ok(val)
 }
 
-
 /// Build a minimal AS-REQ DER for the given `cname` principal in `realm`.
 ///
 /// `cname` should blend in with the environment (e.g. a plausible admin typo like
@@ -283,7 +287,13 @@ pub fn build_as_req(realm: &str, cname: &str) -> Vec<u8> {
     let padata = build_pa_pac_request_field();
 
     // KDC-REQ SEQUENCE
-    let kdc_req_inner = [encode_context(1, &pvno), encode_context(2, &msg_type), padata, req_body].concat();
+    let kdc_req_inner = [
+        encode_context(1, &pvno),
+        encode_context(2, &msg_type),
+        padata,
+        req_body,
+    ]
+    .concat();
     let kdc_req = encode_sequence(&kdc_req_inner);
 
     // APPLICATION 10 wrapper (AS-REQ tag = 0x6A)
@@ -381,7 +391,6 @@ fn skip_der_length(data: &[u8], pos: &mut usize) -> Result<(), TimeSourceError> 
     read_der_length(data, pos)?;
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

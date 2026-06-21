@@ -58,7 +58,7 @@ pub fn build_negotiate_request() -> Vec<u8> {
         b[0..2].copy_from_slice(&36u16.to_le_bytes()); // StructureSize
         b[2..4].copy_from_slice(&dialect_count.to_le_bytes()); // DialectCount
         b[4..6].copy_from_slice(&1u16.to_le_bytes()); // SecurityMode (signing enabled, not required)
-        // b[6..8] Reserved = 0
+                                                      // b[6..8] Reserved = 0
         b[8..12].copy_from_slice(&SMB2_CAPABILITIES.to_le_bytes()); // Capabilities
 
         // OPSEC: Random ClientGuid (UUIDv4)
@@ -73,7 +73,7 @@ pub fn build_negotiate_request() -> Vec<u8> {
         // SMB 3.1.1 negotiate context location fields (MS-SMB2 §2.2.3)
         b[28..32].copy_from_slice(&neg_ctx_offset.to_le_bytes()); // NegotiateContextOffset
         b[32..34].copy_from_slice(&1u16.to_le_bytes()); // NegotiateContextCount
-        // b[34..36] Reserved2 = 0
+                                                        // b[34..36] Reserved2 = 0
 
         // Dialects at body offset 36
         for (i, &d) in dialects.iter().enumerate() {

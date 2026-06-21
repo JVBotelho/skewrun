@@ -15,7 +15,6 @@ use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct SmbSource;
 
-
 /// Sequential field reader for little-endian binary structs.
 struct FieldReader<'a> {
     buf: &'a [u8],
@@ -79,7 +78,8 @@ impl TimeSource for SmbSource {
 }
 
 fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
@@ -97,7 +97,9 @@ fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
 
     // Read NetBIOS header (4 bytes) to know response length.
     let mut nb_header = [0u8; 4];
-    stream.read_exact(&mut nb_header).map_err(|e| map_io_err(e, "read_header"))?;
+    stream
+        .read_exact(&mut nb_header)
+        .map_err(|e| map_io_err(e, "read_header"))?;
     // NetBIOS session message: byte 0 = 0x00, bytes 1..4 = 24-bit big-endian length.
     let msg_len = u32::from_be_bytes(nb_header) & 0x00FF_FFFF;
     if msg_len > 65536 {
@@ -114,7 +116,9 @@ fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
     }
 
     let mut body = vec![0u8; msg_len as usize];
-    stream.read_exact(&mut body).map_err(|e| map_io_err(e, "read_body"))?;
+    stream
+        .read_exact(&mut body)
+        .map_err(|e| map_io_err(e, "read_body"))?;
 
     let rtt = t_send.elapsed();
 
@@ -129,7 +133,6 @@ fn fetch_smb(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
 
     Ok(server_us - t_mid_us)
 }
-
 
 /// Parse SMB2 NEGOTIATE_RESPONSE (MS-SMB2 §2.2.4) and extract SystemTime.
 fn parse_negotiate_response(b: &[u8]) -> Result<SystemTime, TimeSourceError> {
@@ -154,7 +157,6 @@ fn parse_negotiate_response(b: &[u8]) -> Result<SystemTime, TimeSourceError> {
 
     filetime_to_system_time(system_time)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -226,7 +228,10 @@ mod tests {
         );
         // NegotiateContextOffset at body offset 28 → pkt[4 + 64 + 28] = pkt[96]
         let neg_ctx_off = u32::from_le_bytes([req[96], req[97], req[98], req[99]]);
-        assert_eq!(neg_ctx_off, 112, "NegotiateContextOffset must be 112 (8-byte aligned from SMB2 header start)");
+        assert_eq!(
+            neg_ctx_off, 112,
+            "NegotiateContextOffset must be 112 (8-byte aligned from SMB2 header start)"
+        );
         // PREAUTH_INTEGRITY_CAPABILITIES context type at pkt[4 + 112] = pkt[116]
         assert_eq!(
             u16::from_le_bytes([req[116], req[117]]),
@@ -260,8 +265,8 @@ mod tests {
 }
 
 #[cfg(feature = "fuzzing")]
-pub fn fuzz_parse_negotiate_response(data: &[u8]) 
-    -> Result<std::time::SystemTime, crate::time_src::TimeSourceError> 
-{
+pub fn fuzz_parse_negotiate_response(
+    data: &[u8],
+) -> Result<std::time::SystemTime, crate::time_src::TimeSourceError> {
     parse_negotiate_response(data)
 }

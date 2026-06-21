@@ -47,7 +47,9 @@ impl TimeSource for CldapSource {
 
 fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| map_io_err(e, "bind"))?;
-    socket.set_read_timeout(Some(timeout)).map_err(|e| map_io_err(e, "set_read_timeout"))?;
+    socket
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| map_io_err(e, "set_read_timeout"))?;
     socket
         .set_write_timeout(Some(timeout))
         .map_err(|e| map_io_err(e, "set_write_timeout"))?;
@@ -60,7 +62,9 @@ fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, Time
     let t_send = Instant::now();
     let t_send_sys = SystemTime::now();
 
-    socket.send_to(&req, addr).map_err(|e| map_io_err(e, "send_to"))?;
+    socket
+        .send_to(&req, addr)
+        .map_err(|e| map_io_err(e, "send_to"))?;
 
     // Enforce an overall deadline across the receive loop. Without it, an on-path
     // attacker or a UDP flood with spoofed source IPs could keep the loop spinning
@@ -72,9 +76,13 @@ fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, Time
             .checked_duration_since(Instant::now())
             .filter(|d| !d.is_zero())
             .ok_or(TimeSourceError::Timeout)?;
-        socket.set_read_timeout(Some(remaining)).map_err(|e| map_io_err(e, "set_read_timeout"))?;
+        socket
+            .set_read_timeout(Some(remaining))
+            .map_err(|e| map_io_err(e, "set_read_timeout"))?;
 
-        let (len, src) = socket.recv_from(&mut buf).map_err(|e| map_io_err(e, "recv_from"))?;
+        let (len, src) = socket
+            .recv_from(&mut buf)
+            .map_err(|e| map_io_err(e, "recv_from"))?;
         if src.ip() == addr.ip() {
             break len;
         }
@@ -90,7 +98,6 @@ fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, Time
 
     Ok(server_us - t_mid_us)
 }
-
 
 fn build_cldap_search_request(msg_id: i32) -> Vec<u8> {
     // timeLimit = 0: no client-imposed limit. Standard per RFC 4511 §4.5.1 and
@@ -299,7 +306,6 @@ fn parse_cldap_search_response(
     ))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,8 +343,9 @@ mod tests {
 }
 
 #[cfg(feature = "fuzzing")]
-pub fn fuzz_parse_cldap_response(resp: &[u8], msg_id: i32) 
-    -> Result<std::time::SystemTime, crate::time_src::TimeSourceError> 
-{
+pub fn fuzz_parse_cldap_response(
+    resp: &[u8],
+    msg_id: i32,
+) -> Result<std::time::SystemTime, crate::time_src::TimeSourceError> {
     parse_cldap_search_response(resp, msg_id)
 }

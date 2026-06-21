@@ -27,7 +27,6 @@ use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct NtlmSource;
 
-
 impl TimeSource for NtlmSource {
     fn name(&self) -> &'static str {
         "ntlm"
@@ -44,7 +43,8 @@ impl TimeSource for NtlmSource {
 }
 
 fn fetch_ntlm(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
-    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
+    let mut stream =
+        TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
@@ -87,7 +87,6 @@ fn fetch_ntlm(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeS
 
     Ok(server_us - t_mid_us)
 }
-
 
 fn build_session_setup_type1() -> Vec<u8> {
     // Build NTLMSSP Type 1 (MS-NLMP §2.2.1.1)
@@ -294,7 +293,9 @@ fn parse_ntlm_type2(ntlm: &[u8]) -> Result<SystemTime, TimeSourceError> {
 
 fn read_smb_message(stream: &mut TcpStream) -> Result<Vec<u8>, TimeSourceError> {
     let mut nb_header = [0u8; 4];
-    stream.read_exact(&mut nb_header).map_err(|e| map_io_err(e, "read_header"))?;
+    stream
+        .read_exact(&mut nb_header)
+        .map_err(|e| map_io_err(e, "read_header"))?;
     let msg_len = u32::from_be_bytes(nb_header) & 0x00FF_FFFF;
     if msg_len > 65536 {
         return Err(TimeSourceError::Protocol(format!(
@@ -303,10 +304,11 @@ fn read_smb_message(stream: &mut TcpStream) -> Result<Vec<u8>, TimeSourceError> 
         )));
     }
     let mut body = vec![0u8; msg_len as usize];
-    stream.read_exact(&mut body).map_err(|e| map_io_err(e, "read_body"))?;
+    stream
+        .read_exact(&mut body)
+        .map_err(|e| map_io_err(e, "read_body"))?;
     Ok(body)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -367,8 +369,8 @@ mod tests {
 }
 
 #[cfg(feature = "fuzzing")]
-pub fn fuzz_parse_ntlm_type2(data: &[u8]) 
-    -> Result<std::time::SystemTime, crate::time_src::TimeSourceError> 
-{
+pub fn fuzz_parse_ntlm_type2(
+    data: &[u8],
+) -> Result<std::time::SystemTime, crate::time_src::TimeSourceError> {
     parse_ntlm_type2(data)
 }

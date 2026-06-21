@@ -73,4 +73,3 @@ jobs:
                         fuzz_parse_generalized_time; do
             cargo +nightly fuzz run $target -- -max_total_time=60
           done
-        working-directory: fuzz
