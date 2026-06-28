@@ -19,7 +19,7 @@ jobs:
           - aarch64-unknown-linux-musl
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
@@ -36,7 +36,7 @@ jobs:
       run: cargo zigbuild --release --target ${{ matrix.target }} --package skewrun
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: skewrun-${{ matrix.target }}
         path: target/${{ matrix.target }}/release/skewrun
@@ -46,10 +46,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Download artifacts
-      uses: actions/download-artifact@v4
+      uses: actions/download-artifact@v8
       with:
         path: artifacts
 
@@ -60,7 +60,7 @@ jobs:
         mv artifacts/skewrun-aarch64-unknown-linux-musl/skewrun release_assets/skewrun-aarch64-linux-musl
 
     - name: Release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v3
       with:
         files: release_assets/*
       env:
