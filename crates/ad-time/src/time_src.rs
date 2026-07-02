@@ -70,7 +70,7 @@ impl Orchestrator {
                     }
                     last_err = Some(format!("{}: {}", src.name(), e));
                     if i + 1 < n {
-                        let jitter_ms: u64 = rand::thread_rng().gen_range(500..=5_000);
+                        let jitter_ms: u64 = rand::rng().random_range(500..=5_000);
                         std::thread::sleep(Duration::from_millis(jitter_ms));
                     }
                 }
