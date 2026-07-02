@@ -55,7 +55,7 @@ fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, Time
         .map_err(|e| map_io_err(e, "set_write_timeout"))?;
 
     // OPSEC: Randomize message ID (1..1000)
-    let msg_id = rand::thread_rng().gen_range(1..=1000);
+    let msg_id = rand::rng().random_range(1..=1000);
 
     let req = build_cldap_search_request(msg_id);
 

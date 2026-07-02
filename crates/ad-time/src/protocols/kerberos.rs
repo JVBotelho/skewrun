@@ -246,7 +246,7 @@ fn parse_context_integer_u32(b: &[u8]) -> Result<u32, TimeSourceError> {
 /// fingerprint (`^nonexistent\d+$`). A typo of a known-but-wrong principal generates
 /// Event 4768 with FailureCode 0x6 (unknown principal), which is universal AD noise.
 pub fn build_as_req(realm: &str, cname: &str) -> Vec<u8> {
-    let nonce: u32 = rand::thread_rng().gen();
+    let nonce: u32 = rand::rng().random();
     let till = kerberos_time_plausible_future();
 
     // Encode sub-structures.

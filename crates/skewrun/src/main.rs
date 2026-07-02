@@ -15,7 +15,7 @@ use ad_time::protocols::ntlm::NtlmSource;
 use ad_time::protocols::ntp::NtpSource;
 use ad_time::protocols::smb::SmbSource;
 use ad_time::time_src::{format_offset, Orchestrator, TimeSource};
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use rand::Rng;
 
 const STEALTH_USERS_POOL: &[&str] = &[
@@ -100,7 +100,7 @@ fn main() -> anyhow::Result<()> {
     let realm = args.realm.or_else(read_realm_from_krb5_conf);
 
     let stealth_user = args.stealth_user.unwrap_or_else(|| {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         STEALTH_USERS_POOL.choose(&mut rng).unwrap().to_string()
     });
 
@@ -151,7 +151,7 @@ fn run_probe(
     let mut first = true;
     for src in &sources {
         if !first {
-            let jitter_ms: u64 = rand::thread_rng().gen_range(500..=5_000);
+            let jitter_ms: u64 = rand::rng().random_range(500..=5_000);
             std::thread::sleep(Duration::from_millis(jitter_ms));
         }
         first = false;
