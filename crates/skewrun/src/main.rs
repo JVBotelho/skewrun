@@ -29,6 +29,7 @@ const STEALTH_USERS_POOL: &[&str] = &[
 #[derive(Parser, Debug)]
 #[command(
     name = "skewrun",
+    version,
     about = "Query DC time via Kerberos/NTP/SMB and run a command under faketime with the correct offset",
     after_help = "EXAMPLES:\n  skewrun 10.10.10.5 -r CORP.LOCAL -- impacket-getTGT CORP.LOCAL/user:pass\n  skewrun 10.10.10.5 --probe"
 )]
