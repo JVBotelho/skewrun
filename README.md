@@ -3,6 +3,7 @@
 [![CI](https://github.com/JVBotelho/skewrun/actions/workflows/ci.yml/badge.svg)](https://github.com/JVBotelho/skewrun/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/skewrun.svg)](https://crates.io/crates/skewrun)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13512/badge)](https://www.bestpractices.dev/projects/13512)
+[![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/JVBotelho/skewrun/badge)](https://securityscorecards.dev/viewer/?uri=github.com/JVBotelho/skewrun)
 
 `skewrun` is an Active Directory time discovery toolkit for red teams. It dynamically resolves the Domain Controller's time via network protocols (CLDAP, SMB, NTP, Kerberos, NTLM) and executes commands via `libfaketime` (`LD_PRELOAD`), tricking the executed binary into using the exact DC time.
 
