@@ -5,13 +5,14 @@ on:
     tags:
       - 'v*.*.*'
 
-permissions:
-  contents: write
+
 
 jobs:
   build:
     name: Build release binaries
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     strategy:
       matrix:
         target:
@@ -19,24 +20,25 @@ jobs:
           - aarch64-unknown-linux-musl
 
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
       with:
+        toolchain: stable
         targets: ${{ matrix.target }}
 
     - name: Install Zig
-      uses: mlugg/setup-zig@v2
+      uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
 
     - name: Install cargo-zigbuild
-      uses: taiki-e/install-action@cargo-zigbuild
+      uses: taiki-e/install-action@c80aa426f9496ec5c2c1de850f2d713d34aed6eb # cargo-zigbuild
 
     - name: Build with cargo-zigbuild
       run: cargo zigbuild --release --target ${{ matrix.target }} --package skewrun
 
     - name: Upload artifact
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: skewrun-${{ matrix.target }}
         path: target/${{ matrix.target }}/release/skewrun
@@ -45,11 +47,13 @@ jobs:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-    - uses: actions/checkout@v7
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
     - name: Download artifacts
-      uses: actions/download-artifact@v8
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         path: artifacts
 
@@ -60,7 +64,7 @@ jobs:
         mv artifacts/skewrun-aarch64-unknown-linux-musl/skewrun release_assets/skewrun-aarch64-linux-musl
 
     - name: Release
-      uses: softprops/action-gh-release@v3
+      uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
       with:
         files: release_assets/*
       env:
