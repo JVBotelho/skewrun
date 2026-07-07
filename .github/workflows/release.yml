@@ -49,6 +49,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -62,6 +64,13 @@ jobs:
         mkdir -p release_assets
         mv artifacts/skewrun-x86_64-unknown-linux-musl/skewrun release_assets/skewrun-x86_64-linux-musl
         mv artifacts/skewrun-aarch64-unknown-linux-musl/skewrun release_assets/skewrun-aarch64-linux-musl
+
+    - name: Generate artifact attestation
+      uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+      with:
+        subject-path: |
+          release_assets/skewrun-x86_64-linux-musl
+          release_assets/skewrun-aarch64-linux-musl
 
     - name: Release
       uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
