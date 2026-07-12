@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::common::{map_io_err, system_time_to_us};
 use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
+use super::socket_opts::set_windows_ttl_udp;
 
 pub struct NtpSource;
 
@@ -50,6 +51,7 @@ fn fetch_ntp(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSo
     req[44..48].copy_from_slice(&t1_ntp.1.to_be_bytes());
 
     socket.connect(addr).map_err(|e| map_io_err(e, "connect"))?;
+    set_windows_ttl_udp(&socket).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
 
     let t_send = Instant::now();
     socket.send(&req).map_err(|e| map_io_err(e, "send"))?;

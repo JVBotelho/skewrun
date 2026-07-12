@@ -14,9 +14,8 @@ use ad_time::protocols::kerberos::KerberosSource;
 use ad_time::protocols::ntlm::NtlmSource;
 use ad_time::protocols::ntp::NtpSource;
 use ad_time::protocols::smb::SmbSource;
-use ad_time::time_src::{format_offset, Orchestrator, TimeSource};
+use ad_time::time_src::{format_offset, Orchestrator, TimeSource, probe_jitter, randomize_sigma};
 use rand::seq::IndexedRandom;
-use rand::Rng;
 
 const STEALTH_USERS_POOL: &[&str] = &[
     "admnistrator",
@@ -65,6 +64,15 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
+    /// Log-normal jitter sigma parameter (default: 0.4). Higher = wider spread.
+    /// 0.1 = tight near base, 0.8 = heavy right tail. Zero disables jitter.
+    #[arg(long, default_value_t = 0.4, value_parser = parse_sigma)]
+    jitter_sigma: f64,
+
+    /// Base inter-protocol delay in milliseconds before jitter (default: 8000).
+    #[arg(long, default_value_t = 8000, value_parser = parse_base_ms)]
+    jitter_base_ms: u64,
+
     /// Only calculate and print the offset; do not run a command
     #[arg(short = 'p', long)]
     print_offset: bool,
@@ -80,6 +88,31 @@ struct Args {
     /// Command and arguments to run under faketime (everything after --)
     #[arg(last = true)]
     command: Vec<String>,
+}
+
+fn parse_sigma(s: &str) -> Result<f64, String> {
+    let v: f64 = s
+        .parse()
+        .map_err(|_| format!("`{}` is not a valid number", s))?;
+    if !v.is_finite() || v < 0.0 {
+        Err(format!(
+            "jitter sigma must be finite and non-negative (got {})",
+            v
+        ))
+    } else {
+        Ok(v)
+    }
+}
+
+fn parse_base_ms(s: &str) -> Result<u64, String> {
+    let v: u64 = s
+        .parse()
+        .map_err(|_| format!("`{}` is not a valid integer", s))?;
+    if v == 0 {
+        Err("jitter base delay must be greater than zero".to_string())
+    } else {
+        Ok(v)
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -105,6 +138,8 @@ fn main() -> anyhow::Result<()> {
         STEALTH_USERS_POOL.choose(&mut rng).unwrap().to_string()
     });
 
+    let sigma = randomize_sigma(args.jitter_sigma);
+
     if args.probe {
         return run_probe(
             target,
@@ -112,6 +147,8 @@ fn main() -> anyhow::Result<()> {
             timeout,
             &args.method,
             &stealth_user,
+            sigma,
+            args.jitter_base_ms,
         );
     }
 
@@ -119,7 +156,8 @@ fn main() -> anyhow::Result<()> {
         Some(o) => o,
         None => {
             let sources = build_sources(&args.method, realm.as_deref(), &stealth_user);
-            let orchestrator = Orchestrator::new(sources, args.verbose);
+            let orchestrator = Orchestrator::new(sources, args.verbose)
+                .with_jitter(sigma, args.jitter_base_ms);
 
             let (offset_us, method) = orchestrator.resolve(target, timeout)?;
             let f = format_offset(offset_us);
@@ -145,6 +183,8 @@ fn run_probe(
     timeout: Duration,
     method_csv: &str,
     stealth_user: &str,
+    sigma: f64,
+    base_ms: u64,
 ) -> anyhow::Result<()> {
     let sources = build_sources(method_csv, realm, stealth_user);
     let mut any_success = false;
@@ -152,8 +192,7 @@ fn run_probe(
     let mut first = true;
     for src in &sources {
         if !first {
-            let jitter_ms: u64 = rand::rng().random_range(500..=5_000);
-            std::thread::sleep(Duration::from_millis(jitter_ms));
+            std::thread::sleep(probe_jitter(sigma, base_ms));
         }
         first = false;
         match src.fetch(target, timeout) {
@@ -320,6 +359,39 @@ mod tests {
     fn build_sources_empty_csv_yields_no_sources() {
         let sources = build_sources("", None, "test");
         assert_eq!(sources.len(), 0);
+    }
+
+    // --- parse_sigma / parse_base_ms ---
+
+    #[test]
+    fn parse_sigma_rejects_inf() {
+        assert!(parse_sigma("inf").is_err());
+    }
+
+    #[test]
+    fn parse_sigma_rejects_negative() {
+        assert!(parse_sigma("-1").is_err());
+    }
+
+    #[test]
+    fn parse_sigma_rejects_nan() {
+        assert!(parse_sigma("NaN").is_err());
+    }
+
+    #[test]
+    fn parse_sigma_accepts_valid() {
+        assert_eq!(parse_sigma("0.4").unwrap(), 0.4);
+        assert_eq!(parse_sigma("0").unwrap(), 0.0);
+    }
+
+    #[test]
+    fn parse_base_ms_rejects_zero() {
+        assert!(parse_base_ms("0").is_err());
+    }
+
+    #[test]
+    fn parse_base_ms_accepts_valid() {
+        assert_eq!(parse_base_ms("8000").unwrap(), 8000);
     }
 
     // --- run_under_faketime: F10 regression guard ---

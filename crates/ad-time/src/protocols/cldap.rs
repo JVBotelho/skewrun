@@ -23,10 +23,12 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime};
 
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 use super::ber::{encode_integer_i32, encode_tlv};
 use super::common::{map_io_err, parse_generalized_time, system_time_to_us};
 use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
+use super::socket_opts::set_windows_ttl_udp;
 
 pub struct CldapSource;
 
@@ -47,6 +49,7 @@ impl TimeSource for CldapSource {
 
 fn fetch_cldap(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| map_io_err(e, "bind"))?;
+    set_windows_ttl_udp(&socket).map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
     socket
         .set_read_timeout(Some(timeout))
         .map_err(|e| map_io_err(e, "set_read_timeout"))?;
@@ -116,13 +119,14 @@ fn build_cldap_search_request(msg_id: i32) -> Vec<u8> {
     let filter = encode_tlv(0x87, b"objectClass");
 
     // Attributes to request
-    let attrs = vec![
+    let mut attrs = vec![
         "schemaNamingContext",
         "namingContexts",
         "currentTime",
         "dnsHostName",
         "supportedLDAPVersion",
     ];
+    attrs.shuffle(&mut rand::rng());
     let mut attrs_seq = Vec::new();
     for a in attrs {
         attrs_seq.extend_from_slice(&encode_tlv(0x04, a.as_bytes()));

@@ -18,6 +18,10 @@ confidence-threshold = 0.8
 [bans]
 multiple-versions = "warn"
 wildcards = "allow"
+skip = [
+    # getrandom 0.4 pulled by tempfile → proptest (dev-dependency only, never in release binary)
+    { name = "getrandom", version = "0.4" },
+]
 
 [sources]
 unknown-registry = "deny"

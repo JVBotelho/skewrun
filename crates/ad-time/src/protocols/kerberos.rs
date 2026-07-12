@@ -14,7 +14,7 @@
 /// Offset precision: ±RTT/2 (single-point approximation, not four-point NTP
 /// triangulation). Sufficient for Kerberos' 5-minute skew window.
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime};
 
 use rand::Rng;
@@ -25,6 +25,7 @@ use super::ber::{
 };
 use super::common::{map_io_err, parse_generalized_time, system_time_to_us};
 use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
+use super::socket_opts::connect_tcp_with_ttl;
 
 // DER/ASN.1 tag constants used in KRB-ERROR parsing (RFC 4120 §5.9.1).
 const KRB_ERROR_TAG: u8 = 0x7E; // APPLICATION 30
@@ -65,7 +66,7 @@ fn fetch_kerberos(
     timeout: Duration,
 ) -> Result<OffsetMicros, TimeSourceError> {
     let mut stream =
-        TcpStream::connect_timeout(&addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
+        connect_tcp_with_ttl(addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;
