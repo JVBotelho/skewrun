@@ -11,7 +11,7 @@ categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 thiserror = "2.0"
-rand = "0.9"
+rand = "0.10"
 
 [dev-dependencies]
 proptest = "1"
