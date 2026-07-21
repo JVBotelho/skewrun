@@ -44,8 +44,7 @@ impl TimeSource for NtlmSource {
 }
 
 fn fetch_ntlm(addr: SocketAddr, timeout: Duration) -> Result<OffsetMicros, TimeSourceError> {
-    let mut stream =
-        connect_tcp_with_ttl(addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
+    let mut stream = connect_tcp_with_ttl(addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;

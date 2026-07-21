@@ -22,13 +22,13 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime};
 
-use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::Rng;
 
 use super::ber::{encode_integer_i32, encode_tlv};
 use super::common::{map_io_err, parse_generalized_time, system_time_to_us};
-use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 use super::socket_opts::set_windows_ttl_udp;
+use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct CldapSource;
 

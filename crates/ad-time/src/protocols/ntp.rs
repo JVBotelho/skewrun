@@ -6,8 +6,8 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::common::{map_io_err, system_time_to_us};
-use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 use super::socket_opts::set_windows_ttl_udp;
+use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 pub struct NtpSource;
 

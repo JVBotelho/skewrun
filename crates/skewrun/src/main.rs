@@ -14,7 +14,7 @@ use ad_time::protocols::kerberos::KerberosSource;
 use ad_time::protocols::ntlm::NtlmSource;
 use ad_time::protocols::ntp::NtpSource;
 use ad_time::protocols::smb::SmbSource;
-use ad_time::time_src::{format_offset, Orchestrator, TimeSource, probe_jitter, randomize_sigma};
+use ad_time::time_src::{format_offset, probe_jitter, randomize_sigma, Orchestrator, TimeSource};
 use rand::seq::IndexedRandom;
 
 const STEALTH_USERS_POOL: &[&str] = &[
@@ -156,8 +156,8 @@ fn main() -> anyhow::Result<()> {
         Some(o) => o,
         None => {
             let sources = build_sources(&args.method, realm.as_deref(), &stealth_user);
-            let orchestrator = Orchestrator::new(sources, args.verbose)
-                .with_jitter(sigma, args.jitter_base_ms);
+            let orchestrator =
+                Orchestrator::new(sources, args.verbose).with_jitter(sigma, args.jitter_base_ms);
 
             let (offset_us, method) = orchestrator.resolve(target, timeout)?;
             let f = format_offset(offset_us);

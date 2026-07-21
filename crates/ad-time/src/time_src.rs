@@ -42,7 +42,12 @@ pub struct Orchestrator {
 
 impl Orchestrator {
     pub fn new(sources: Vec<Box<dyn TimeSource>>, verbose: bool) -> Self {
-        Self { sources, verbose, sigma: 0.4, base_ms: 8000 }
+        Self {
+            sources,
+            verbose,
+            sigma: 0.4,
+            base_ms: 8000,
+        }
     }
 
     pub fn with_jitter(mut self, sigma: f64, base_ms: u64) -> Self {

@@ -24,8 +24,8 @@ use super::ber::{
     encode_integer_i32, encode_integer_u64, encode_sequence, encode_tlv,
 };
 use super::common::{map_io_err, parse_generalized_time, system_time_to_us};
-use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 use super::socket_opts::connect_tcp_with_ttl;
+use crate::time_src::{OffsetMicros, TimeSource, TimeSourceError};
 
 // DER/ASN.1 tag constants used in KRB-ERROR parsing (RFC 4120 §5.9.1).
 const KRB_ERROR_TAG: u8 = 0x7E; // APPLICATION 30
@@ -65,8 +65,7 @@ fn fetch_kerberos(
     stealth_user: &str,
     timeout: Duration,
 ) -> Result<OffsetMicros, TimeSourceError> {
-    let mut stream =
-        connect_tcp_with_ttl(addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
+    let mut stream = connect_tcp_with_ttl(addr, timeout).map_err(|e| map_io_err(e, "connect"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| TimeSourceError::Protocol(e.to_string()))?;

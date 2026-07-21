@@ -2,7 +2,7 @@ use std::io;
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
-use socket2::{Domain, Protocol, Socket, Type, SockRef};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 
 const WINDOWS_TTL: u32 = 128;
 
