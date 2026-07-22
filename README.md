@@ -5,6 +5,8 @@
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/13512/badge)](https://www.bestpractices.dev/projects/13512)
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/JVBotelho/skewrun/badge)](https://securityscorecards.dev/viewer/?uri=github.com/JVBotelho/skewrun)
 
+![skewrun demo](https://raw.githubusercontent.com/JVBotelho/skewrun/main/assets/demo.gif)
+
 `skewrun` is an Active Directory time discovery toolkit for red teams. It dynamically resolves the Domain Controller's time via network protocols (CLDAP, SMB, NTP, Kerberos, NTLM) and executes commands via `libfaketime` (`LD_PRELOAD`), tricking the executed binary into using the exact DC time.
 
 This solves the Kerberos `KRB_AP_ERR_SKEW` (Clock Skew Too Great) error, allowing you to run tools like Impacket or NetExec from a Linux attack machine whose clock is heavily desynchronized from the target Windows domain, **without requiring root privileges to change the system time**.
