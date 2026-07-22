@@ -46,6 +46,9 @@ skewrun 10.10.10.100 --print-offset
 
 # Offline mode: supply a known offset manually
 skewrun --offset "+3.450s" -- impacket-getTGT ...
+
+# Tune inter-method jitter (default: sigma=0.4, base=8000ms; sigma=0 disables jitter)
+skewrun 10.10.10.100 --jitter-sigma 0.2 --jitter-base-ms 5000 -- impacket-getTGT ...
 ```
 
 ## Using as a library
@@ -75,11 +78,19 @@ Skewrun queries the DC to calculate the exact microsecond offset `(DC_Time - Loc
 
 ## Forensic Noise & Evasion
 
-The goal is to blend in with standard Windows wire traffic and minimize forensic footprint on the DC. 
+The goal is to blend in with standard Windows wire traffic and minimize forensic footprint on the DC.
+
+Independent of which method is used: every outbound socket sets TTL=128 and enables Nagle
+(`TCP_NODELAY=0`) *before* the TCP handshake, matching a Windows client's network-stack
+fingerprint instead of the Linux defaults (TTL=64, Nagle off) that a passive observer (p0f,
+Zeek `conn.log`) would otherwise flag. Delays between methods use CSPRNG-backed log-normal
+jitter (not a flat random range) with exponential backoff on repeated failures, avoiding the
+uniform-timing signature a fixed jitter band leaves in connection logs — see `--jitter-sigma`
+and `--jitter-base-ms` above.
 
 | Method | Protocol | Port | OPSEC Notes (EDR/NDR Visibility) |
 |--------|----------|------|-----------------------------------|
-| **cldap** (Default) | CLDAP | UDP/389 | **Extremely Stealthy**. Universally allowed. Sends a standard LDAP `rootDSE` diagnostic query (`objectClass=*` base search), matching the baseline of `ldapsearch`, PowerShell AD cmdlets, and monitoring tools. Dilutes the attribute list with common admin attrs and randomizes `timeLimit` to break static NDR signatures. |
+| **cldap** (Default) | CLDAP | UDP/389 | **Extremely Stealthy**. Universally allowed. Sends a standard LDAP `rootDSE` diagnostic query (`objectClass=*` base search), matching the baseline of `ldapsearch`, PowerShell AD cmdlets, and monitoring tools. Dilutes the attribute list with common admin attrs and randomizes the attribute order per request to break static NDR signatures. |
 | **smb** (Default) | SMB2 | TCP/445 | **Stealthy**. Extracts time from the `SMB2 NEGOTIATE` response. Negotiates SMB 3.1.1 with `PREAUTH_INTEGRITY_CAPABILITIES` (SHA-512), matching Windows 10/11 client behavior. |
 | **ntp** (Default) | SNTP | UDP/123 | **Standard**. Native RFC 4330. Highly expected traffic from any client. |
 | **ntlm** | SMB2 | TCP/445 | **Stealthy**. Exploits `SMB2 SESSION_SETUP` to get an NTLM Type 2 Challenge containing `MsvAvTimestamp`. Disconnects TCP before Type 3, meaning **no Event ID 4625 (Logon Failure) is generated**. Emulates Windows 10/11 flags. |

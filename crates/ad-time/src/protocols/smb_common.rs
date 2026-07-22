@@ -80,7 +80,8 @@ pub fn build_negotiate_request() -> Vec<u8> {
             let off = 36 + i * 2;
             b[off..off + 2].copy_from_slice(&d.to_le_bytes());
         }
-        // Padding to 8-byte alignment is already zero from vec! initialization.
+        // Padding to 8-byte alignment per MS-SMB2 §2.2.3: MUST be zero when sent.
+        // Already zero from the outer vec! initialization — no explicit fill needed.
 
         // PREAUTH_INTEGRITY_CAPABILITIES negotiate context at body offset 48
         let ctx_off = 36 + dialects_size + padding_size;

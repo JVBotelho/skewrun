@@ -6,3 +6,4 @@ pub mod ntlm;
 pub mod ntp;
 pub mod smb;
 pub(crate) mod smb_common;
+pub(crate) mod socket_opts;
